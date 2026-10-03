@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 运行时生成的东西（每个人的位置/大小/音量都不一样，不该进仓库）
+pet_config.json
+sounds/
+
+# 说明：assets/pet.gif 是仓库自带的占位角色，需要一起提交。
+# 如果你把它换成了自己私人的角色图、不想公开，把下面这行取消注释即可。
+# assets/pet.gif
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

@@ -1,193 +1,169 @@
 # -*- coding: utf-8 -*-
-"""生成 README 用的演示图 / 演示动图。
+"""生成 README 用的演示图。合成一张假的「桌面」场景，不暴露真实桌面内容。
 
-用法：
-    python tools/make_demo.py                 # 用 assets/pet.gif
-    python tools/make_demo.py 路径/角色.gif    # 用指定图片
-
-产物：
-    assets/demo.png   静态效果图（角色 + 气泡 + 菜单）
-    assets/demo.gif   动态演示（点击弹性 + 气泡弹出）
+用法：  python tools/make_demo.py
+产物：  assets/demo.png（静态）  assets/demo.gif（气泡弹出 + 逐字打字 + 点击弹跳）
 """
-import sys
-import tkinter as tk
 from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
 
 from PIL import Image, ImageDraw, ImageFont
 
-import desktop_pet as dp
-
+ROOT = Path(__file__).resolve().parent.parent
+ASSETS = ROOT / "assets"
 W, H = 1080, 620
-KEY = dp.TRANSPARENT_KEY
+NAVY = (32, 49, 112)
+CARD = (255, 255, 255)
+BORDER = (216, 222, 232)
+TEXT = (24, 34, 48)
+MUTED = (150, 160, 175)
+ACCENT = (84, 174, 255)
 
 
-def key_to_rgba(img):
-    """把键控色背景的 RGB 图转成带 alpha 的 RGBA。"""
-    rgba = img.convert("RGBA")
-    key = dp.hex_rgb(KEY)
-    px = rgba.load()
-    for y in range(rgba.height):
-        for x in range(rgba.width):
-            if px[x, y][:3] == key:
-                px[x, y] = (0, 0, 0, 0)
-    return rgba
+def font(size, bold=False):
+    for name in (("msyhbd.ttc",) if bold else ()) + ("msyh.ttc", "simhei.ttf", "simsun.ttc"):
+        p = Path(r"C:\Windows\Fonts") / name
+        if p.exists():
+            try:
+                return ImageFont.truetype(str(p), size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
 
 
 def backdrop():
-    """画一张假的「桌面」：渐变壁纸 + 一个半透明文档窗口，用来体现真透明。"""
     bg = Image.new("RGB", (W, H), (24, 34, 58))
     d = ImageDraw.Draw(bg)
-    for y in range(H):                                    # 竖向渐变
+    for y in range(H):
         k = y / H
-        d.line([(0, y), (W, y)],
-               fill=(int(28 + 40 * k), int(38 + 26 * k), int(70 + 46 * k)))
-    for i in range(0, W + H, 46):                         # 斜向暗纹
-        d.line([(i, 0), (i - H, H)], fill=(255, 255, 255, 6))
+        d.line([(0, y), (W, y)], fill=(int(28 + 40 * k), int(38 + 26 * k), int(70 + 46 * k)))
+    for i in range(0, W + H, 46):
+        d.line([(i, 0), (i - H, H)], fill=(40, 52, 84))
 
-    card = Image.new("RGBA", (470, 330), (0, 0, 0, 0))
+    card = Image.new("RGBA", (430, 320), (0, 0, 0, 0))
     cd = ImageDraw.Draw(card)
-    cd.rounded_rectangle([0, 0, 469, 329], radius=14, fill=(255, 255, 255, 236))
-    cd.rounded_rectangle([0, 0, 469, 46], radius=14, fill=(240, 243, 250, 255))
-    cd.rectangle([0, 32, 469, 46], fill=(240, 243, 250, 255))
+    cd.rounded_rectangle([0, 0, 429, 319], radius=14, fill=(255, 255, 255, 236))
+    cd.rounded_rectangle([0, 0, 429, 44], radius=14, fill=(240, 243, 250, 255))
+    cd.rectangle([0, 30, 429, 44], fill=(240, 243, 250, 255))
     for i, c in enumerate(((255, 95, 86), (255, 189, 46), (39, 201, 63))):
         cd.ellipse([18 + i * 20, 15, 30 + i * 20, 27], fill=c)
-    font = dp.find_font(15)
-    cd.text((22, 74), "今天的任务", font=font, fill=(40, 52, 78))
+    cd.text((22, 70), "今天的任务", font=font(15), fill=(40, 52, 78))
     for i in range(5):
-        y = 112 + i * 34
-        cd.rounded_rectangle([22, y, 22 + (300 - i * 34), y + 11], radius=5,
-                             fill=(206, 214, 230, 255))
-    cd.rounded_rectangle([22, 288, 200, 312], radius=7, fill=(84, 174, 255, 255))
-    bg.paste(card, (70, 150), card)
-
-    tag = dp.find_font(17)
-    d.text((72, 574), "角色图透明背景 → 直接贴在桌面上，没有窗口边框",
-           font=tag, fill=(178, 194, 224))
-    return bg
+        y = 106 + i * 32
+        cd.rounded_rectangle([22, y, 22 + (280 - i * 32), y + 11], radius=5, fill=(206, 214, 230, 255))
+    cd.rounded_rectangle([22, 276, 190, 300], radius=7, fill=ACCENT)
+    bg.paste(card, (60, 150), card)
+    d.text((62, 500), "透明背景 → 直接贴在桌面上，没有窗口边框",
+           font=font(17), fill=(178, 194, 224))
+    return bg.convert("RGBA")
 
 
-def pet_frames(path, size):
-    frames, _ = dp.load_frames(str(path))
-    out = []
-    for f in frames:
-        r = f.resize((size, size), Image.LANCZOS)
-        a = r.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
-        out.append((r, a))
-    return out
+def bubble_img(text, width=250):
+    """把文字画进气泡底图的白色椭圆内部（和程序里同一套比例）。"""
+    b = Image.open(ASSETS / "bubble.png").convert("RGBA")
+    b = b.resize((width, int(b.height * width / b.width)), Image.LANCZOS)
+    d = ImageDraw.Draw(b)
+    px, py = int(b.width * 0.10), int(b.height * 0.09)
+    cx = b.width / 2
+    cy = (py + b.height * 0.60) / 2
+    d.multiline_text((cx, cy), text, font=font(13), fill=NAVY,
+                     anchor="mm", align="center", spacing=4)
+    return b
 
 
-def paste_pet(canvas, frame, xy, sy=1.0, sx=1.0):
-    img, _ = frame
-    w, h = max(1, int(img.width * sx)), max(1, int(img.height * sy))
-    r = img.resize((w, h), Image.LANCZOS)
-    a = r.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
-    canvas.paste(r, (int(xy[0]), int(xy[1])), a)
-    return w, h
+MENU_ITEMS = [
+    ("亲密值 73 / 100", "hint"),
+    ("今日：已点击 · 未对话", "hint"),
+    ("-", "sep"),
+    ("番茄钟", "sub"),
+    ("窗口大小", "sub"),
+    ("音效音量", "sub"),
+    ("窗口置顶", "check"),
+    ("-", "sep"),
+    ("退出", "cmd"),
+]
 
 
-def menu_image(items, palette, width=None):
-    """直接借用 CatMenu 的渲染函数画一张菜单卡片（不弹真窗口）。"""
-    root = tk.Tk()
-    root.withdraw()
-    menu = dp.CatMenu(root, KEY, palette)
-    rows, height = menu._layout(items)
-    width = width or menu._width_for(items)
-    menu.panels = [{"items": items, "rows": rows, "w": width, "h": height,
-                    "win": None, "label": None, "x": 0, "y": 0, "image": None}]
-    menu.hover = (0, 3)
-    img = menu._render(0)
-    root.destroy()
-    return key_to_rgba(img)
+def menu_img(width=200):
+    f = font(15)
+    row_h, sep_h, pad = 34, 13, 8
+    height = pad * 2 + sum(sep_h if t == "sep" else row_h for _, t in MENU_ITEMS)
+    card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    d = ImageDraw.Draw(card)
+    d.rounded_rectangle([0, 0, width - 1, height - 1], radius=12,
+                        fill=CARD + (255,), outline=BORDER + (255,), width=1)
+    y = pad
+    for label, kind in MENU_ITEMS:
+        if kind == "sep":
+            d.line([(12, y + sep_h // 2), (width - 13, y + sep_h // 2)], fill=BORDER, width=1)
+            y += sep_h
+            continue
+        if kind == "hint":                      # 灰色信息行
+            d.text((20, y + 9), label, font=f, fill=MUTED)
+        else:
+            hover = (label == "番茄钟")
+            if hover:
+                d.rounded_rectangle([8, y, width - 9, y + row_h], radius=6, fill=(243, 245, 248))
+            if kind == "check":          # 对勾用折线画（中文字体缺 U+2713）
+                cy = y + row_h // 2
+                d.line([(8, cy), (12, cy + 4), (18, cy - 5)], fill=NAVY, width=2, joint="curve")
+            d.text((20, y + 9), label, font=f, fill=ACCENT if hover else TEXT)
+            if kind == "sub":
+                cy = y + row_h // 2
+                d.polygon([(width - 22, cy - 4), (width - 22, cy + 4), (width - 14, cy)], fill=NAVY)
+        y += row_h
+    return card
 
 
-def bubble_image(text, width_hint=None):
-    root = tk.Tk()
-    root.withdraw()
-    b = dp.Bubble(root, KEY)
-    img = b.build(text, 0.32, True)
-    root.destroy()
-    return img
+CHAR = Image.open(ASSETS / "pet_character.png").convert("RGBA")
 
 
-def build_menu_items():
-    return [
-        {"type": "command", "label": "暂停动画"},
-        {"type": "command", "label": "换一句台词"},
-        {"type": "separator"},
-        {"type": "submenu", "label": "番茄钟"},
-        {"type": "submenu", "label": "窗口大小"},
-        {"type": "submenu", "label": "不透明度"},
-        {"type": "submenu", "label": "音效音量"},
-        {"type": "command", "label": "窗口置顶", "checked": True},
-        {"type": "separator"},
-        {"type": "command", "label": "退出"},
-    ]
+def pet_at(canvas, size, x, y, squash=1.0):
+    w = max(1, int(size * (2.0 - squash)))
+    h = max(1, int(size * squash))
+    im = CHAR.resize((w, h), Image.LANCZOS)
+    canvas.paste(im, (int(x + (size - w) / 2), int(y + (size - h))), im)
 
 
-def make_png(frames, out: Path):
-    canvas = backdrop().convert("RGBA")
-    pet_x, pet_y, pet_size = 250, 292, 300
-    paste_pet(canvas, frames[12], (pet_x, pet_y - 70))     # 弹起状态，展示形变空间
-
-    bub = bubble_image("哼，才不是特意在这里等你的呢。")
-    canvas.paste(bub, (pet_x + pet_size // 2 - bub.width // 2, pet_y - 78 - bub.height), bub)
-
-    menu = menu_image(build_menu_items(), dp.THEME_LIGHT)
-    canvas.paste(menu, (640, 108), menu)
-
-    tip = dp.find_font(15)
-    ImageDraw.Draw(canvas).text((648, 108 + menu.height + 14),
-                                "自绘圆角卡片菜单，跟随系统深浅色", font=tip,
-                                fill=(178, 194, 224))
-    canvas.convert("RGB").save(out, quality=95)
-    print("saved", out, canvas.size)
+def make_png():
+    canvas = backdrop()
+    pet_at(canvas, 300, 250, 250)
+    b = bubble_img("哼，才不是特意在这里等你的呢。")
+    canvas.paste(b, (250 + 150 - b.width // 2, 250 - 18 - b.height), b)
+    m = menu_img()
+    canvas.paste(m, (680, 80), m)
+    ImageDraw.Draw(canvas).text((686, 80 + m.height + 12), "自绘圆角菜单，跟随系统深浅色",
+                                font=font(15), fill=(178, 194, 224))
+    canvas.convert("RGB").save(ASSETS / "demo.png")
+    print("saved assets/demo.png", canvas.size)
 
 
-def make_gif(frames, out: Path):
-    """按下压扁 → 松开回弹 → 气泡弹出，循环播放。"""
-    pet_x, pet_y, pet_size = 300, 246, 278
-    base = backdrop().convert("RGBA")
-    menu = menu_image(build_menu_items(), dp.THEME_LIGHT, width=196)
-    base.paste(menu, (700, 120), menu)
-
-    curve = [1.0, 0.94, 0.88, 0.88, 0.96, 1.04, 1.10, 1.05, 1.0, 1.0,
-             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-    out_frames = []
-    for i, k in enumerate(curve):
+def make_gif():
+    base = backdrop()
+    m = menu_img(190)
+    base.paste(m, (720, 70), m)
+    line = "有什么事要和我说吗？"
+    frames = []
+    squash_curve = [1.0, 0.94, 0.88, 0.86, 0.95, 1.04, 1.0]
+    for i in range(26):
         canvas = base.copy()
-        sy, sx = k, 2.0 - k                        # 压扁时变宽，符合体积守恒的观感
-        _, h = paste_pet(canvas, frames[(i * 3) % len(frames)],
-                         (pet_x, pet_y + (pet_size - pet_size * sy)), sy, sx)
-        if i >= 4:                                  # 回弹之后才弹气泡
-            p = min(1.0, (i - 4) / 6.0)
-            img = bubble_image("点我干嘛，陪我玩吗？")
-            w = int(img.width * (0.7 + 0.3 * p))
-            hh = int(img.height * (0.7 + 0.3 * p))
-            img = img.resize((w, hh), Image.LANCZOS)
-            alpha = img.getchannel("A").point(lambda v: int(v * p))
-            img.putalpha(alpha)
-            canvas.paste(img, (pet_x + pet_size // 2 - w // 2, pet_y - 96 - hh), img)
-        out_frames.append(canvas.convert("P", palette=Image.ADAPTIVE, colors=128))
-
-    out_frames[0].save(out, save_all=True, append_images=out_frames[1:],
-                       duration=90, loop=0, optimize=True, disposal=2)
-    print("saved", out, "frames", len(out_frames),
-          "size", out.stat().st_size // 1024, "KB")
-
-
-def main():
-    path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "assets" / "pet.gif"
-    if not path.exists():
-        raise SystemExit(f"找不到角色图：{path}")
-    dp.enable_dpi_awareness()
-    frames = pet_frames(path, 300)
-    (ROOT / "assets").mkdir(exist_ok=True)
-    make_png(frames, ROOT / "assets" / "demo.png")
-    make_gif(frames, ROOT / "assets" / "demo.gif")
+        squash = squash_curve[i] if i < len(squash_curve) else 1.0
+        pet_at(canvas, 280, 300, 250, squash)
+        if i >= 6:
+            p = min(1.0, (i - 6) / 9.0)
+            shown = line[:max(1, int(len(line) * p))]
+            b = bubble_img(shown)
+            s = 0.7 + 0.3 * p
+            b = b.resize((max(1, int(b.width * s)), max(1, int(b.height * s))), Image.LANCZOS)
+            a = b.getchannel("A").point(lambda v: int(v * min(1.0, p * 1.6)))
+            b.putalpha(a)
+            canvas.paste(b, (300 + 140 - b.width // 2, 250 - 16 - b.height), b)
+        frames.append(canvas.convert("P", palette=Image.ADAPTIVE, colors=128))
+    out = ASSETS / "demo.gif"
+    frames[0].save(out, save_all=True, append_images=frames[1:],
+                   duration=110, loop=0, optimize=True, disposal=2)
+    print("saved assets/demo.gif", out.stat().st_size // 1024, "KB")
 
 
 if __name__ == "__main__":
-    main()
+    make_png()
+    make_gif()

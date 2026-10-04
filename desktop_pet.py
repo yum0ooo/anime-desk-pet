@@ -1,10 +1,53 @@
 # -*- coding: utf-8 -*-
 """
-桌面宠物小摆件  Desktop Pet
-------------------------------------------------
-· 透明无边框、始终置顶
-· 左键拖动，单击弹台词气泡，右键菜单调大小/退出
-· 纯本地运行，不联网、无后端依赖
+桌面宠物小摆件 · PySide6 版  Desktop Pet (Qt)
+================================================
+Tkinter 版 desktop_pet.py 的 1:1 功能移植 + AI 聊天 / 亲密值 / 双阶段番茄钟。
+
+--------------------------------------------------------------------------
+★ 点击优先级规则（唯一权威实现见 DesktopPet.handle_click，改这里必须同步改注释）
+--------------------------------------------------------------------------
+左键单击角色时，严格按下面的顺序判断，命中即返回：
+
+  1. 番茄钟正在响铃（state ∈ {FOCUS_RINGING, BREAK_RINGING}）
+     → 只做「关掉铃声 + 立刻进入下一阶段」，并弹跳 + 按下/松开音效。
+       **绝不打开 AI 输入框，绝不把气泡改成聊天提示。**
+  2. AI 输入框已经打开
+     → 只是把它重新聚焦（activateWindow + setFocus），不重复开第二个。
+  3. 番茄钟某个阶段正在倒计时（state ∈ {FOCUS, BREAK}）
+     → 只弹跳，气泡继续显示倒计时，**不劫持成聊天提示**。
+  4. 其它情况（IDLE）
+     → 走 AI 聊天流程：弹跳 → 气泡傲娇提示 → 角色下方弹出输入框。
+
+附带：任何一次左键点击都会先结算「今天的第一次点击」（+1 亲密值，每天一次）。
+
+--------------------------------------------------------------------------
+★ 番茄钟状态机（两阶段循环，只能靠点击或菜单停止）
+--------------------------------------------------------------------------
+    IDLE ──开始专注──► FOCUS(25min) ──倒计时归零──► FOCUS_RINGING
+                                                       │ 左键点击
+                                                       ▼
+                    BREAK_RINGING ◄──倒计时归零── BREAK(10min)
+                          │ 左键点击
+                          └──────────► FOCUS ...
+
+  · *_RINGING 状态下铃声每 ALARM_REPEAT_MS 重复一次，**不会自己停**。
+  · 只有左键点击角色（或菜单「停止番茄钟」/退出程序）才能结束响铃。
+  · 菜单「停止番茄钟」结束整个循环：停铃、取消所有定时器、隐藏气泡。
+
+--------------------------------------------------------------------------
+其它要点
+--------------------------------------------------------------------------
+· 真·逐像素透明（Qt.WA_TranslucentBackground + FramelessWindowHint）。
+· 角色图 / 气泡图一律按 **物理像素** 渲染：先用 PIL Image.LANCZOS 放大到
+  size * devicePixelRatioF()，再 pixmap.setDevicePixelRatio(dpr)，
+  这样 Qt 是 1:1 贴图，不再被 DPR 二次重采样 —— 高分屏下不再发虚。
+· 空闲时窗口 **纹丝不动**（没有呼吸/漂浮动画）；只有左键点击的弹跳动画。
+· 台词气泡是 QLabel 子类窗口，背景 bubble.png，文字画在白椭圆内部，鼠标穿透。
+· AI 请求在 QThread 里跑，GUI 线程永不阻塞；回复用 QTimer 逐字打字机输出。
+· API Key 只放在同目录的 config.json，绝不写进 pet_config.json、绝不硬编码。
+· 音效沿用本地正弦合成 + winsound 播放 + sounds/ 目录 WAV 缓存。
+· 右键菜单用 QMenu + Qt Style Sheets 圆角卡片，跟随系统深浅色。
 """
 import array
 import ctypes
@@ -14,11 +57,24 @@ import os
 import random
 import sys
 import time
-import tkinter as tk
+import urllib.error
+import urllib.request
 import wave
+from datetime import date
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageTk
+from PySide6.QtCore import (
+    Property, QAbstractAnimation, QEasingCurve, QEvent, QPoint,
+    QPropertyAnimation, QRect, Qt, QThread, QTimer, Signal,
+)
+from PySide6.QtGui import (
+    QColor, QFont, QGuiApplication, QImage, QPainter, QPixmap,
+)
+from PySide6.QtWidgets import (
+    QApplication, QLabel, QLineEdit, QMenu, QMessageBox,
+)
+
+from PIL import Image
 
 try:
     import winsound
@@ -26,43 +82,47 @@ except ImportError:            # 非 Windows 平台静音运行
     winsound = None
 
 try:
-    from PySide6.QtCore import QCoreApplication, QTimer
-except ImportError:            # 没装 PySide6 时番茄钟会自动禁用，其余功能照常
-    QCoreApplication = None
-    QTimer = None
+    import winreg
+except ImportError:
+    winreg = None
 
 # ============================================================
-#  ★ 角色图片路径（支持 GIF / PNG）
-#    默认取本文件同级的 assets/pet.gif，也可以直接写绝对路径，
-#    或用环境变量 DESKTOP_PET_IMAGE / pet_config.json 里的 image 覆盖。
+#  ★ 素材路径（角色图 / 气泡图，改成你自己的图片即可，透明 PNG）
+#    默认取本文件同级的同名文件，所以整个文件夹可以随便搬。
 # ============================================================
-IMAGE_PATH = str(Path(__file__).resolve().parent / "assets" / "pet.gif")
+HERE = Path(__file__).resolve().parent
+IMAGE_PATH = str(HERE / "assets" / "pet_character.png")
+BUBBLE_PATH = str(HERE / "assets" / "bubble.png")
 
 # ---------------- 可调参数 ----------------
-TRANSPARENT_KEY = "#ff00fe"   # 抠像用的键控色（图片里不含该颜色）
 BUBBLE_MS = 2500              # 气泡停留时间（毫秒）
 MIN_SCALE, MAX_SCALE = 0.25, 2.0
-BUBBLE_MAX_TEXT_W = 240       # 气泡文字最大宽度
-BUBBLE_FONT_SIZE = 15
 DRAG_THRESHOLD = 4            # 位移小于该像素视为“点击”
 CLICK_MAX_SECONDS = 0.6
+MIN_OPACITY = 0.20
 
-# 气泡样式：几何沿用 BongoCat 卡片，配色与弹出方式借用 DeepSeek 鲸鱼挂件
-BUBBLE_RADIUS = 12
-BUBBLE_BG = "#ffffff"
-BUBBLE_BORDER = "#e8ebf1"
-BUBBLE_TEXT = "#536ba9"          # ← 鲸鱼挂件的正文色
-BUBBLE_HINT = "#9fb0d9"          # ← 鲸鱼挂件的次要文字色
-BUBBLE_PAD_X, BUBBLE_PAD_Y = 16, 11
-BUBBLE_TAIL_W, BUBBLE_TAIL_H = 16, 8
-BUBBLE_ANIM_MS, BUBBLE_ANIM_STEPS = 200, 8   # 鲸鱼：scale(.7→1) + 淡入，200ms ease
-BUBBLE_FADE_MS = 140                          # 消失时快速淡出
-BUBBLE_START_SCALE = 0.7                      # ← 鲸鱼泡泡的起始缩放
+# ---------------- 弹跳（唯一的动画；空闲不呼吸、不漂浮）----------------
+JUMP_MS = 520                 # 单击弹跳总时长
+JUMP_KEYS = ((0.0, 0), (0.28, -34), (0.62, 0), (0.82, -12), (1.0, 0))  # 跳一下 + 小回弹
 
-# ---------------- 菜单配色（取自 BongoCat 自绘菜单的深/浅色表）----------------
-MENU_FONT_SIZE = 15
-MENU_ROW_H, MENU_SEP_H, MENU_PAD_Y = 34, 13, 8
-MENU_TEXT_X, MENU_MIN_W, MENU_RADIUS = 20, 200, 12
+# ---------------- 气泡文字排版（白色椭圆内部，避开下面两个小尾巴圆点）----------------
+BUBBLE_TEXT_FAMILY = "Microsoft YaHei"
+BUBBLE_TEXT_SIZE = 13.5       # pt
+BUBBLE_TEXT_RATIO = 0.62      # 椭圆正文区高度占整张气泡图的比例
+BUBBLE_TEXT_INSET = 0.09      # 左右各内缩 9%
+BUBBLE_TEXT_COLOR = "#203170"  # 气泡描边那种深海军蓝
+BUBBLE_MIN_SCALE = 0.55       # 气泡相对于原图的最小缩放
+BUBBLE_MAX_SCALE = 1.30
+BUBBLE_TAIL_OFFSET = 6        # 尾巴圆点正下方那一点点留白
+BUBBLE_ANIM_MS = 180          # 弹出时的淡入时长
+BUBBLE_FADE_MS = 140          # 消失时的淡出时长
+
+# ---------------- 菜单外观（BongoCat 自绘菜单的深/浅色表）----------------
+MENU_FONT_SIZE = 10           # pt
+MENU_RADIUS = 12
+MENU_MIN_W = 200
+MENU_ROW_H = 30
+MENU_PAD_Y = 6
 THEME_DARK = {
     "surface": "#21242b", "field": "#2a2e37", "border": "#3b424f",
     "text": "#f4f7fb", "muted": "#9aa4b2", "accent": "#54aeff",
@@ -71,29 +131,92 @@ THEME_LIGHT = {
     "surface": "#ffffff", "field": "#f3f5f8", "border": "#d8dee8",
     "text": "#182230", "muted": "#667085", "accent": "#54aeff",
 }
-SCALE_PRESETS = (("迷你", 0.40), ("小", 0.60), ("标准", 0.80), ("大", 1.00), ("超大", 1.30))
+SCALE_PRESETS = (("迷你", 0.50), ("小", 0.70), ("标准", 0.90), ("大", 1.10), ("超大", 1.30))
 OPACITY_PRESETS = (100, 90, 80, 70, 60, 50, 40, 30, 20)
-MIN_OPACITY = 0.20
 
 # ============================================================
 #  ★ 番茄钟 / 音效参数（改这里就行）
 # ============================================================
 POMODORO_MINUTES = 25          # ★ 专注时长（分钟）。测试时可临时改成 1
+BREAK_MINUTES = 10             # ★ 休息时长（分钟）
 POMODORO_TICK_MS = 200         # QTimer 间隔，只影响刷新频率，不影响计时精度
-ALARM_SECONDS = 10             # 到点后提示音持续多少秒
+ALARM_REPEAT_MS = 1400         # 响铃重复间隔（毫秒）——响铃不会自己停，只能点击/菜单停
 SOUND_VOLUME_DEFAULT = 65      # 默认音量 0-100
 VOLUME_PRESETS = (0, 25, 50, 75, 100)
 SAMPLE_RATE = 44100
 
-# 点击弹性：直接借 DeepSeek 鲸鱼挂件的参数
-# （按下 scaleY(.88) scaleX(1.05)，松开回 1，转换 220ms cubic-bezier(.34,1.56,.64,1)，
-#   变换原点 50% 100% —— 也就是脚踩在地上、从底部中心压缩）
-SQUISH_MS = 220
-SQUISH_STEPS = 8
-SQUISH_DOWN = (0.88, 1.05)     # (scaleY, scaleX)
-SQUISH_UP = (1.0, 1.0)
+# 番茄钟状态常量
+POMO_IDLE = "IDLE"
+POMO_FOCUS = "FOCUS"
+POMO_FOCUS_RINGING = "FOCUS_RINGING"
+POMO_BREAK = "BREAK"
+POMO_BREAK_RINGING = "BREAK_RINGING"
+POMO_RINGING_STATES = (POMO_FOCUS_RINGING, POMO_BREAK_RINGING)
+POMO_RUNNING_STATES = (POMO_FOCUS, POMO_BREAK)
 
-# ---------------- 台词库 ----------------
+POMO_TEXT_FOCUS = "🍅 专注中 {clock}"
+POMO_TEXT_BREAK = "🍅 休息中 {clock}"
+POMO_TEXT_FOCUS_DONE = "🍅 时间到！点我一下"
+POMO_TEXT_BREAK_DONE = "🍅 休息结束，点我一下"
+
+# ============================================================
+#  ★ 亲密值系统（持久化在 pet_config.json 里）
+# ============================================================
+AFFECTION_MIN = 0
+AFFECTION_MAX = 100
+AFFECTION_DEFAULT = 50                    # 首次运行的默认值
+AFFECTION_CLICK_GAIN = 1                  # 每天第一次点击 +1
+AFFECTION_CHAT_GAIN = 2                   # 每天第一次发消息 +2
+AFFECTION_IDLE_PENALTY = 1                # 一整天没点击也没聊天 -1
+AFFECTION_MAX_PENALTY_PER_STARTUP = 10    # 单次结算最多扣 10，防止一次掉到 0
+AFFECTION_GREETING_MIN = 70               # ≥ 该值启动时会主动关心一句
+AFFECTION_GREETING_DELAY_MS = 1200        # 启动后约 1.2 秒说
+AFFECTION_GREETINGS = [
+    "今天也要好好喝水哦。",
+    "回来啦？我一直在等你。",
+    "别老盯着屏幕，眼睛会坏的。",
+    "今天也要加油，我在这儿陪着你。",
+    "记得按时吃饭，笨蛋。",
+    "累的话就靠一会儿，我不吵你。",
+]
+AFFECTION_KEYS = ("affection", "affection_date", "clicked_today", "chatted_today")
+
+# ============================================================
+#  ★ AI 聊天参数（Token 经济：越短越省钱）
+# ============================================================
+DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+AI_MAX_TOKENS = 160                      # 回复上限：很小，够 1~2 句
+AI_TEMPERATURE = 1.1
+AI_HISTORY_TURNS = 3                     # 内存里最多保留 3 轮（6 条消息）
+AI_MAX_INPUT_CHARS = 300                 # 用户输入硬截断
+AI_TIMEOUT_S = 20                        # 单次请求超时（秒）
+AI_TYPING_MS = 45                        # 打字机：每个字 45ms，由 QTimer 驱动
+AI_WAITING_TEXT = "……"
+AI_PROMPT_LINE = "有什么事要和我说吗？人家可是很忙的……"
+AI_ERROR_NO_KEY = "唔…你还没给我钥匙呢！去 config.json 里填上 deepseek_api_key 吧。"
+AI_ERROR_LINE = "唔…信号好像不太好，等下再试一次好不好？"
+AI_ERROR_EMPTY = "哼，你就给我这么点东西？再想一句啦。"
+AI_CHAT_PLACEHOLDER = "说点什么…（回车发送 / Esc 取消）"
+AI_CHAT_IDLE_MS = 15000                  # 点击角色后 15 秒无操作 → 自动收起输入框和气泡
+
+# 紧凑人设提示词：唯一能显著省 token 的地方（< ~120 tokens）
+AI_SYSTEM_PROMPT = (
+    "你是桌面宠物里的傲娇动漫少女「小宠」。"
+    "用中文口语回答，语气傲娇但心里关心对方，偶尔加「哼」「才不是」。"
+    "回复必须极短：1~2 句、40 字以内、不要表情、不要换行、不说教、不解释。"
+)
+
+# AI Key 配置文件（独立于 pet_config.json，绝不硬编码，绝不混在一起）
+# 真正的 CONFIG_PATH 在下面 app_dir() 定义之后绑定
+DEFAULT_AI_CONFIG = {
+    "deepseek_api_key": "",
+    "deepseek_model": DEEPSEEK_MODEL,
+    "deepseek_base_url": DEEPSEEK_BASE_URL,
+}
+
+# ---------------- 台词库（旧版点击循环台词，现已不再绑定到点击，
+#                  仅保留给 say_random() 内部/外部调用者使用）----------------
 LINES = [
     "点我干嘛，陪我玩吗？",
     "哼，才不是特意在这里等你的呢。",
@@ -115,15 +238,8 @@ LINES = [
     "事情做完了吗？没做完就先别摸我。",
     "我也没在等你，只是刚好站在这里。",
     "今天也要元气满满哦，笨蛋。",
-    "给你三秒钟把手拿开……三、二……算了。",
-    "我可不是摆件，我是有脾气的。",
-    "你是不是又熬夜了？脸色好差。",
-    "诶，你点我，是不是想我了？",
-    "好无聊啊，陪我聊聊天嘛。",
-    "夸我一句，我就原谅你。",
-    "别老盯着屏幕看，也看看我呀。",
-    "天气不错，可惜你不出门。",
 ]
+
 
 # ---------------- 路径工具 ----------------
 def app_dir() -> Path:
@@ -132,11 +248,13 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-CONFIG_PATH = app_dir() / "pet_config.json"
+PET_CONFIG_PATH = app_dir() / "pet_config.json"    # 宠物自己的状态（位置/大小/亲密值）
+CONFIG_PATH = app_dir() / "config.json"            # ★ DeepSeek API Key（独立文件）
+SOUND_DIR = app_dir() / "sounds"
 
 
 def enable_dpi_awareness() -> None:
-    """让窗口在高分屏下保持清晰、坐标不缩放。"""
+    """让窗口在高分屏下保持清晰、坐标不缩放。必须在 QApplication 之前调用。"""
     try:
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
         return
@@ -153,70 +271,21 @@ def enable_dpi_awareness() -> None:
         pass
 
 
-def make_click_through(win: tk.Toplevel) -> None:
-    """让气泡窗口不接收鼠标事件、不抢焦点。"""
+def apply_high_dpi_policy() -> None:
+    """DPR 取真实小数（PassThrough），否则 1.25 会被四舍五入成 1.0 → 贴图发虚。
+    必须在 QApplication 构造之前调用。"""
     try:
-        win.update_idletasks()
-        GWL_EXSTYLE = -20
-        WS_EX_TRANSPARENT = 0x00000020
-        WS_EX_NOACTIVATE = 0x08000000
-        WS_EX_TOOLWINDOW = 0x00000080
-        user32 = ctypes.windll.user32
-        for hwnd in {int(win.winfo_id()), user32.GetParent(int(win.winfo_id()))}:
-            if not hwnd:
-                continue
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(
-                hwnd, GWL_EXSTYLE,
-                style | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            )
+        QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     except Exception:
         pass
 
 
-# ---------------- 素材加载 ----------------
-def load_frames(path: str):
-    """读取 GIF/PNG，返回 (RGBA 帧列表, 每帧时长毫秒)。"""
-    im = Image.open(path)
-    frames, durations = [], []
-    total = getattr(im, "n_frames", 1)
-    for i in range(total):
-        im.seek(i)
-        frames.append(im.convert("RGBA"))
-        durations.append(max(20, int(im.info.get("duration") or 100)))
-    return frames, durations
-
-
-def content_box(frames):
-    """所有帧非透明区域的并集，用于定位“头顶”。"""
-    box = None
-    for f in frames:
-        bb = f.getchannel("A").point(lambda v: 255 if v >= 128 else 0).getbbox()
-        if not bb:
-            continue
-        box = bb if box is None else (
-            min(box[0], bb[0]), min(box[1], bb[1]),
-            max(box[2], bb[2]), max(box[3], bb[3]),
-        )
-    return box or (0, 0, frames[0].width, frames[0].height)
-
-
-def centered_frame_index(frames):
-    """找出人物最“居中”的那一帧（重心最接近全程平均），暂停时定格在这一帧。"""
-    centers = []
-    for f in frames:
-        bb = f.getchannel("A").point(lambda v: 255 if v >= 128 else 0).getbbox()
-        centers.append((bb[0] + bb[2]) / 2 if bb else f.width / 2)
-    if not centers:
-        return 0
-    target = sum(centers) / len(centers)
-    return min(range(len(centers)), key=lambda i: abs(centers[i] - target))
-
-
 def system_prefers_dark() -> bool:
-    """读取 Windows 个性化设置里的“应用模式”，跟随系统深浅色（同 BongoCat 的 dark_theme）。"""
+    """读取 Windows 个性化设置里的“应用模式”，跟随系统深浅色。"""
+    if winreg is None:
+        return False
     try:
-        import winreg
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER,
             r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
@@ -227,50 +296,144 @@ def system_prefers_dark() -> bool:
         return False
 
 
-def find_font(size: int):
-    for name in ("msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc", "arial.ttf"):
-        p = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", name)
-        if os.path.exists(p):
-            try:
-                return ImageFont.truetype(p, size)
-            except Exception:
-                continue
-    return ImageFont.load_default()
+# ---------------- 素材加载 ----------------
+def load_image(path: str) -> Image.Image:
+    """读取图片（GIF 取第一帧），返回 RGBA。"""
+    im = Image.open(path)
+    try:
+        im.seek(0)
+    except Exception:
+        pass
+    return im.convert("RGBA")
 
 
-# ---------------- emoji 支持（中文字体没有 emoji 字形，要单独混排） ----------------
-EMOJI_RANGES = ((0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2B00, 0x2BFF))
-_EMOJI_FONTS = {}
+def content_box(rgba: Image.Image):
+    """非透明区域的包围盒，用于定位“头顶”。"""
+    bb = rgba.getchannel("A").point(lambda v: 255 if v >= 128 else 0).getbbox()
+    return bb or (0, 0, rgba.width, rgba.height)
 
 
-def is_emoji(ch: str) -> bool:
-    o = ord(ch)
-    return any(lo <= o <= hi for lo, hi in EMOJI_RANGES)
+def pil_to_pixmap(rgba: Image.Image) -> QPixmap:
+    data = rgba.tobytes("raw", "RGBA")
+    img = QImage(data, rgba.width, rgba.height, rgba.width * 4,
+                 QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(img)
 
 
-def split_runs(text: str):
-    """把字符串切成 连续 emoji / 连续普通字符 的片段。"""
-    runs = []
-    for ch in text:
-        kind = "e" if is_emoji(ch) else "t"
-        if runs and runs[-1][0] == kind:
-            runs[-1] = (kind, runs[-1][1] + ch)
-        else:
-            runs.append((kind, ch))
-    return runs
+def render_physical(source: Image.Image, logical_w: int, logical_h: int,
+                    dpr: float) -> QPixmap:
+    """★ 清晰度的核心：按「物理像素」渲染，再把 DPR 告诉 Qt。
+
+    PIL 用 LANCZOS 高质量重采样到 logical * dpr，然后 pixmap.setDevicePixelRatio(dpr)，
+    Qt 就会 1:1 直接 blit 到屏幕，不会再用 DPR 二次放大（那才是发虚的根因）。
+    """
+    dpr = float(dpr) if dpr and dpr > 0 else 1.0
+    pw = max(1, int(round(logical_w * dpr)))
+    ph = max(1, int(round(logical_h * dpr)))
+    pm = pil_to_pixmap(source.resize((pw, ph), Image.LANCZOS))
+    pm.setDevicePixelRatio(dpr)
+    return pm
 
 
-def find_emoji_font(size: int):
-    if size not in _EMOJI_FONTS:
-        font = None
-        path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "seguiemj.ttf")
-        if os.path.exists(path):
-            try:
-                font = ImageFont.truetype(path, size)
-            except Exception:
-                font = None
-        _EMOJI_FONTS[size] = font
-    return _EMOJI_FONTS[size]
+# ============================================================
+#  config.json（DeepSeek API Key）读写
+# ============================================================
+def ensure_ai_config(path: Path = None) -> Path:
+    """config.json 不存在（或坏了）就自动补一份空 Key 的，让用户知道该填哪儿。"""
+    path = Path(path or CONFIG_PATH)
+    need = True
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                merged = dict(DEFAULT_AI_CONFIG)
+                merged.update({k: v for k, v in data.items() if k in merged})
+                if merged != data:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(merged, f, ensure_ascii=False, indent=2)
+                need = False
+        except Exception:
+            need = True
+    if need:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_AI_CONFIG, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+    return path
+
+
+def load_ai_config(path: Path = None) -> dict:
+    """读取 config.json（缺字段自动补默认值）。读不到就返回一份默认值，绝不抛异常。"""
+    path = ensure_ai_config(path)
+    data = dict(DEFAULT_AI_CONFIG)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            got = json.load(f)
+        if isinstance(got, dict):
+            for key in data:
+                if key in got and got[key] is not None:
+                    data[key] = got[key]
+    except Exception:
+        pass
+    return data
+
+
+# ============================================================
+#  亲密值：纯函数，方便测试直接调用
+# ============================================================
+def _today_str(today=None) -> str:
+    if today:
+        return str(today)
+    return date.today().isoformat()
+
+
+def clamp_affection(value) -> int:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = AFFECTION_DEFAULT
+    return max(AFFECTION_MIN, min(AFFECTION_MAX, v))
+
+
+def settle_affection(cfg: dict, today=None) -> int:
+    """按“天”结算亲密值，就地在 cfg 里改，返回本次扣除的点数。
+
+    规则：
+      · 同一天重复调用 → 什么都不改（幂等，重启再调也安全）。
+      · 日期翻篇 → 上一记录日若「既没点击也没聊天」扣 1；中间每整整跳过一天再扣 1；
+        单次结算总扣分封顶 AFFECTION_MAX_PENALTY_PER_STARTUP，且最终钳在 0..100。
+      · 首次运行（没有 affection_date）→ 不扣分，只落地默认值。
+    """
+    if not isinstance(cfg, dict):
+        return 0
+    today = _today_str(today)
+    aff = clamp_affection(cfg.get("affection", AFFECTION_DEFAULT))
+    last = cfg.get("affection_date")
+
+    if last == today:                      # 同一天，幂等：一个字节都不动
+        cfg["affection"] = aff
+        return 0
+
+    penalty = 0
+    if isinstance(last, str) and last.strip():
+        try:
+            d_last = date.fromisoformat(last.strip())
+            d_today = date.fromisoformat(today)
+        except ValueError:
+            d_last = d_today = None
+        if d_last is not None and d_last < d_today:
+            interacted = bool(cfg.get("clicked_today")) or bool(cfg.get("chatted_today"))
+            missed = 0 if interacted else 1                 # 上一记录日本身
+            missed += max(0, (d_today - d_last).days - 1)   # 中间整段跳过的日子
+            penalty = min(missed, AFFECTION_MAX_PENALTY_PER_STARTUP)
+
+    cfg["affection"] = clamp_affection(aff - penalty * AFFECTION_IDLE_PENALTY)
+    cfg["affection_date"] = today
+    cfg["clicked_today"] = False
+    cfg["chatted_today"] = False
+    return penalty
 
 
 # ---------------- 音效：本地合成，不依赖任何音频素材文件 ----------------
@@ -296,7 +459,7 @@ def _synth_press():
 
 
 def _synth_release():
-    """松开：音高往上弹，脆一点——对应鲸鱼挂件按下/松开两个音效。"""
+    """松开：音高往上弹，脆一点。"""
     return _synth_blip(420.0, 980.0, 0.17, 22.0, gain=0.62, click_level=0.35)
 
 
@@ -316,7 +479,6 @@ def _synth_chime():
 
 
 SYNTH = {"press": _synth_press, "release": _synth_release, "chime": _synth_chime}
-SOUND_DIR = app_dir() / "sounds"
 
 
 def write_wav(path, samples, volume):
@@ -336,6 +498,7 @@ class Sound:
     def __init__(self, volume=SOUND_VOLUME_DEFAULT):
         self.volume = max(0, min(100, int(volume)))
         self._files = {}
+        self.played = []          # 记录最近播放的名字，方便测试断言（不影响运行）
         try:
             SOUND_DIR.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -358,6 +521,8 @@ class Sound:
         return path
 
     def play(self, name):
+        self.played.append(name)
+        del self.played[:-64]
         if winsound is None or self.volume <= 0:
             return
         path = self._file(name)
@@ -378,544 +543,310 @@ class Sound:
             pass
 
 
-# ---------------- 缓动：BongoCat 的 cubic-bezier(.34, 1.56, .64, 1) 弹簧曲线 ----------------
-def _bezier_table(x1, y1, x2, y2, steps=64):
-    table = []
-    for i in range(steps + 1):
-        t = i / steps
-        mt = 1.0 - t
-        table.append((
-            3 * mt * mt * t * x1 + 3 * mt * t * t * x2 + t ** 3,
-            3 * mt * mt * t * y1 + 3 * mt * t * t * y2 + t ** 3,
-        ))
-    return table
+# ============================================================
+#  AI：DeepSeek 调用 + 后台线程
+# ============================================================
+class AIError(Exception):
+    """带错误码的 AI 异常：code ∈ {no_key, network, http, bad_response}。"""
+
+    def __init__(self, code, detail=""):
+        super().__init__(detail or code)
+        self.code = code
+        self.detail = detail
 
 
-SPRING_TABLE = _bezier_table(0.34, 1.56, 0.64, 1.0)
-EASE_TABLE = _bezier_table(0.25, 0.1, 0.25, 1.0)      # CSS 默认的 ease（鲸鱼泡泡用的就是它）
+def deepseek_chat(messages, *, api_key, base_url=DEEPSEEK_BASE_URL,
+                  model=DEEPSEEK_MODEL, timeout=AI_TIMEOUT_S) -> str:
+    """一次非流式 chat/completions 调用。只用标准库 urllib，无第三方依赖。
 
-
-def _eval_table(table, t):
-    if t <= 0.0:
-        return 0.0
-    if t >= 1.0:
-        return 1.0
-    for i in range(len(table) - 1):
-        x0, y0 = table[i]
-        x1, y1 = table[i + 1]
-        if x0 <= t <= x1:
-            span = x1 - x0
-            k = (t - x0) / span if span > 1e-9 else 0.0
-            return y0 + (y1 - y0) * k
-    return 1.0
-
-
-def spring_ease(t):
-    """BONGO_CAT_UI_EASE_SPRING 的近似求值（点击弹性用）。"""
-    return _eval_table(SPRING_TABLE, t)
-
-
-def ease_out(t):
-    """CSS ease（气泡弹出用）。"""
-    return _eval_table(EASE_TABLE, t)
-
-
-def hex_rgb(value):
-    v = value.lstrip("#")
-    return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
-
-
-def hard_round_mask(width, height, radius, supersample=3):
-    """超采样画圆角遮罩再阈值化：卡片外一定是纯键控色，不会留半透明描边。"""
-    s = supersample
-    mask = Image.new("L", (width * s, height * s), 0)
-    ImageDraw.Draw(mask).rounded_rectangle(
-        [0, 0, width * s - 1, height * s - 1], radius=radius * s, fill=255
+    这个函数 **必须在工作线程里被调用**（GUI 线程调用会阻塞界面）。
+    测试里会把它整个 monkey-patch 掉，所以它保持模块级、按名字查找。
+    """
+    key = str(api_key or "").strip()
+    if not key:
+        raise AIError("no_key", "deepseek_api_key is empty")
+    url = str(base_url or DEEPSEEK_BASE_URL).rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model or DEEPSEEK_MODEL,
+        "messages": messages,
+        "stream": False,
+        "max_tokens": AI_MAX_TOKENS,
+        "temperature": AI_TEMPERATURE,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {key}",
+            "Accept": "application/json",
+        },
     )
-    return mask.resize((width, height), Image.LANCZOS).point(lambda v: 255 if v >= 128 else 0)
-
-
-# ---------------- 台词气泡 ----------------
-class Bubble:
-    """头顶台词气泡：BongoCat 卡片样式（圆角 12 + 1px 描边）+ spring 弹入。"""
-
-    def __init__(self, master: tk.Tk, key: str):
-        self.key = key
-        self.key_rgb = hex_rgb(key)
-        self.probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-        self._emoji_font = find_emoji_font(BUBBLE_FONT_SIZE + 1)
-        self.win = tk.Toplevel(master)
-        self.win.overrideredirect(True)
-        self.win.attributes("-topmost", True)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = ""
         try:
-            self.win.attributes("-transparentcolor", key)
-        except tk.TclError:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
             pass
-        self.win.configure(bg=key)
-        self.label = tk.Label(self.win, bd=0, highlightthickness=0, bg=key)
-        self.label.pack()
-        self.win.withdraw()
-        self._img = None
-        self._job = None
-        self._ready = False
-        self._master = None
-        self._step = 0
-        self._tail_ratio = 0.5
-        self._on_timeout = None
-        self._persistent = False
+        raise AIError("http", f"HTTP {exc.code} {detail}") from exc
+    except Exception as exc:                       # URLError / timeout / DNS / 断网
+        raise AIError("network", repr(exc)) from exc
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        text = data["choices"][0]["message"]["content"]
+    except Exception as exc:
+        raise AIError("bad_response", repr(exc)) from exc
+    return str(text or "").strip()
+
+
+class ChatThread(QThread):
+    """★ 把 HTTP 请求扔到 GUI 线程之外。信号回主线程，界面全程不卡。"""
+
+    replied = Signal(str)
+    failed = Signal(str, str)          # (code, detail)
+
+    def __init__(self, messages, api_key, base_url, model, parent=None):
+        super().__init__(parent)
+        self.messages = messages
+        self.api_key = api_key
+        self.base_url = base_url
+        self.model = model
+
+    def run(self):                      # 在子线程执行
+        try:
+            text = deepseek_chat(
+                self.messages, api_key=self.api_key,
+                base_url=self.base_url, model=self.model,
+            )
+        except AIError as exc:
+            self.failed.emit(exc.code, exc.detail)
+            return
+        except Exception as exc:        # 兜底：绝不让异常掀翻线程
+            self.failed.emit("network", repr(exc))
+            return
+        if not text:
+            self.failed.emit("bad_response", "empty content")
+            return
+        self.replied.emit(text)
+
+
+# ============================================================
+#  台词气泡：QLabel 子类，背景是 bubble.png，文字画在白色椭圆中间
+# ============================================================
+class BubbleLabel(QLabel):
+    """无边框透明气泡窗口（背景按物理像素渲染，不发虚）。
+
+    背景绘制 bubble.png（按 devicePixelRatio 渲染到物理分辨率），文字用
+    QPainter.drawText 居中画在上面那个白色椭圆内部（整图顶部 ~62% 高度、
+    左右各内缩 9%），这样绝不会压到下面两个小尾巴圆点。
+    窗口设置 WA_TransparentForMouseEvents，点气泡等于点在桌面上。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._source = QPixmap(BUBBLE_PATH)
+        try:
+            self._source_img = load_image(BUBBLE_PATH)
+        except Exception:
+            self._source_img = None
+        self._text = ""
+        self._font = QFont(BUBBLE_TEXT_FAMILY, BUBBLE_TEXT_SIZE)
+        self._color = QColor(BUBBLE_TEXT_COLOR)
+        self._fade = 1.0
+        self._render_dpr = 0.0
+        self._bubble_pm = None
+        self._bubble_w = max(120, self._source.width() if not self._source.isNull() else 224)
+        self._bubble_h = int(round(self._bubble_w * (
+            (self._source.height() / self._source.width())
+            if (not self._source.isNull() and self._source.width()) else (196 / 224)
+        )))
+        self._render()
+        self.set_text("")
+        self.hide()
+
+    # ---------- 尺寸 / 文本 ----------
+    def _dpr(self) -> float:
+        try:
+            d = float(self.devicePixelRatioF())
+        except Exception:
+            d = 1.0
+        return d if d > 0 else 1.0
+
+    def _render(self):
+        """按物理分辨率渲染气泡背景（LANCZOS + setDevicePixelRatio）。"""
+        if self._source_img is None:
+            return
+        dpr = self._dpr()
+        self._bubble_pm = render_physical(
+            self._source_img, self._bubble_w, self._bubble_h, dpr)
+        self._render_dpr = dpr
+
+    def rerender(self):
+        """DPR 变了 / 需要重建时调用。"""
+        if abs(self._render_dpr - self._dpr()) > 1e-6 or self._bubble_pm is None:
+            self._render()
+        self.update()
+
+    def set_bubble_width(self, width: int) -> None:
+        """按角色头部宽度自适应气泡大小（保持原图比例）。"""
+        width = int(max(120, min(520, width)))
+        if self._source.isNull():
+            return
+        ratio = self._source.height() / self._source.width()
+        self._bubble_w = width
+        self._bubble_h = max(60, int(round(width * ratio)))
+        self._render()
+        self.resize(self._bubble_w, self._bubble_h)
+
+    def set_text(self, text: str) -> None:
+        self._text = text or ""
+        self.setToolTip(self._text)
+        self.update()
+
+    def text(self) -> str:
+        return self._text
+
+    def showEvent(self, event):          # noqa: N802
+        super().showEvent(event)
+        self.rerender()
+
+    def ellipse_rect(self) -> QRect:
+        """文字要被画进去的矩形（白色椭圆内部）。"""
+        w, h = self._bubble_w, self._bubble_h
+        inset = int(round(w * BUBBLE_TEXT_INSET))
+        top = int(round(h * 0.055))
+        height = int(round(h * BUBBLE_TEXT_RATIO)) - top
+        return QRect(inset, top, max(10, w - inset * 2), max(10, height))
+
+    # ---------- 淡入淡出（画在画布里，窗口本身始终不透明，截屏/置顶都稳） ----------
+    def _get_fade(self):
+        return self._fade
+
+    def _set_fade(self, value):
+        self._fade = min(max(float(value), 0.0), 1.0)
+        self.setWindowOpacity(1.0)      # 窗口不透明度永远满，避免和动画互相覆盖
+        self.update()
+
+    fadeOpacity = Property(float, _get_fade, _set_fade)
 
     # ---------- 绘制 ----------
-    def _measure(self, text, font):
-        """按 emoji / 普通字符混排量宽度。"""
-        total = 0.0
-        for kind, run in split_runs(text):
-            f = self._emoji_font if (kind == "e" and self._emoji_font) else font
-            total += self.probe.textlength(run, font=f)
-        return total
-
-    def _draw_runs(self, draw, x, y, text, font, fill):
-        """按 emoji / 普通字符混排绘制，返回结束时的 x。"""
-        cursor = x
-        for kind, run in split_runs(text):
-            if kind == "e" and self._emoji_font:
-                draw.text((cursor, y), run, font=self._emoji_font, embedded_color=True)
-                cursor += self.probe.textlength(run, font=self._emoji_font)
-            else:
-                draw.text((cursor, y), run, font=font, fill=fill)
-                cursor += self.probe.textlength(run, font=font)
-        return cursor
-
-    def build(self, text: str, tail_ratio: float = 0.5, tail_down: bool = True) -> Image.Image:
-        """生成气泡的 RGBA 图（卡片内不透明，卡片外 alpha=0）。"""
-        font = find_font(BUBBLE_FONT_SIZE)
-
-        lines, cur = [], ""
-        for ch in text:
-            if self._measure(cur + ch, font) <= BUBBLE_MAX_TEXT_W:
-                cur += ch
-            else:
-                lines.append(cur)
-                cur = ch
-        lines.append(cur)
-        lines = [ln for ln in lines if ln] or [text]
-
-        ascent, descent = font.getmetrics()
-        line_h = ascent + descent + 4
-        text_w = max(self._measure(ln, font) for ln in lines)
-
-        body_w = int(max(56, text_w + BUBBLE_PAD_X * 2))
-        body_h = int(line_h * len(lines) + BUBBLE_PAD_Y * 2)
-        W = body_w
-        H = body_h + BUBBLE_TAIL_H
-
-        mask = hard_round_mask(body_w, body_h, BUBBLE_RADIUS)
-        full = Image.new("L", (W, H), 0)
-        full.paste(mask, (0, BUBBLE_TAIL_H if not tail_down else 0))
-
-        cx = int(min(max(tail_ratio, (BUBBLE_RADIUS + 10) / W),
-                     1 - (BUBBLE_RADIUS + 10) / W) * W)
-        half = BUBBLE_TAIL_W // 2
-        S = 4
-        tri = Image.new("L", (W * S, H * S), 0)
-        td = ImageDraw.Draw(tri)
-        if tail_down:
-            base = BUBBLE_TAIL_H + body_h - 6
-            td.polygon([((cx - half) * S, base * S), ((cx + half) * S, base * S),
-                        (cx * S, (BUBBLE_TAIL_H + body_h) * S - 1)], fill=255)
-        else:
-            base = BUBBLE_TAIL_H + 6
-            td.polygon([((cx - half) * S, base * S), ((cx + half) * S, base * S),
-                        (cx * S, 1)], fill=255)
-        tri = tri.resize((W, H), Image.LANCZOS).point(lambda v: 255 if v >= 128 else 0)
-        mask = Image.composite(Image.new("L", (W, H), 255), full, tri)
-
-        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        img.paste(hex_rgb(BUBBLE_BG) + (255,), (0, 0), mask)
-
-        # 边框与文字画在遮罩内，再用遮罩裁一次，保证不会溢出卡片
-        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        d = ImageDraw.Draw(layer)
-        top = 0 if tail_down else BUBBLE_TAIL_H
-        d.rounded_rectangle([0, top, body_w - 1, top + body_h - 1],
-                            radius=BUBBLE_RADIUS, outline=hex_rgb(BUBBLE_BORDER) + (255,))
-        for i, ln in enumerate(lines):
-            self._draw_runs(d, BUBBLE_PAD_X, top + BUBBLE_PAD_Y + i * line_h + 1,
-                            ln, font, hex_rgb(BUBBLE_TEXT) + (255,))
-        img = Image.alpha_composite(img, Image.composite(
-            layer, Image.new("RGBA", (W, H), (0, 0, 0, 0)), mask))
-        return img
-
-    def _to_photo(self, rgba: Image.Image) -> ImageTk.PhotoImage:
-        alpha = rgba.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
-        bg = Image.new("RGB", rgba.size, self.key_rgb)
-        bg.paste(rgba, (0, 0), alpha)
-        return ImageTk.PhotoImage(bg)
-
-    def _prepare(self):
-        if not self._ready:
-            self.win.update_idletasks()
-            # 气泡现在要能被点击（点一下换台词），所以不再做穿透
-            self._ready = True
-
-    # ---------- 显示 / 动画 ----------
-    def cancel(self):
-        if self._job:
-            try:
-                self.win.after_cancel(self._job)
-            except Exception:
-                pass
-            self._job = None
-
-    def bind_click(self, handler):
-        for w in (self.win, self.label):
-            w.bind("<Button-1>", handler)
-
-    def show(self, master: Image.Image, x: int, y: int, on_timeout=None,
-             persistent: bool = False, tail_ratio: float = 0.5):
-        self.cancel()
-        self._master = master
-        self._x, self._y = int(x), int(y)
-        self._on_timeout = on_timeout
-        self._persistent = persistent
-        self._tail_ratio = tail_ratio
-        self._step = 0
-        self.win.deiconify()
-        self.win.lift()
-        self._prepare()
-        try:
-            self.win.attributes("-alpha", 0.03)
-        except tk.TclError:
-            pass
-        self._animate()
-
-    def update_in_place(self, master: Image.Image, x: int, y: int, tail_ratio: float = 0.5):
-        """原地换内容：不重播弹入动画、不移动窗口锚点（番茄钟每秒刷新用）。"""
-        self._master = master
-        self._x, self._y = int(x), int(y)
-        self._tail_ratio = tail_ratio
-        self._img = self._to_photo(master)
-        self.label.configure(image=self._img)
-        self.win.geometry(f"{master.width}x{master.height}+{self._x}+{self._y}")
-        self.win.deiconify()
-        try:
-            self.win.attributes("-alpha", 1.0)
-        except tk.TclError:
-            pass
-
-    def _animate(self):
-        if self._master is None:
-            return
-        W0, H0 = self._master.size
-        if self._step > BUBBLE_ANIM_STEPS:
-            self._settle(W0, H0)
-            return
-        p = ease_out(self._step / BUBBLE_ANIM_STEPS)
-        s = BUBBLE_START_SCALE + (1.0 - BUBBLE_START_SCALE) * p   # 鲸鱼：scale .7 → 1
-        w, h = max(1, int(W0 * s)), max(1, int(H0 * s))
-        frame = self._master.resize((w, h), Image.LANCZOS) if s < 0.999 else self._master
-        self._img = self._to_photo(frame)
-        self.label.configure(image=self._img)
-        tail_x = self._x + self._tail_ratio * W0
-        self.win.geometry(
-            f"{w}x{h}+{int(round(tail_x - self._tail_ratio * w))}"
-            f"+{int(round(self._y + H0 - h - 12 * (1 - p)))}"
+    def paintEvent(self, event):        # noqa: N802 (Qt 命名)
+        painter = QPainter(self)
+        painter.setRenderHints(
+            QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing
+            | QPainter.RenderHint.SmoothPixmapTransform
         )
-        try:
-            self.win.attributes("-alpha", max(0.03, min(1.0, p)))
-        except tk.TclError:
-            pass
-        self._step += 1
-        self._job = self.win.after(max(16, BUBBLE_ANIM_MS // BUBBLE_ANIM_STEPS), self._animate)
+        painter.setOpacity(self._fade)
+        pm = self._bubble_pm
+        if pm is not None and not pm.isNull():
+            painter.drawPixmap(0, 0, pm)     # 已经是物理分辨率，1:1 贴图
+        if self._text:
+            painter.setPen(self._color)
+            painter.setFont(self._font)
+            painter.drawText(
+                self.ellipse_rect(),
+                int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+                    | Qt.TextFlag.TextWordWrap),
+                self._text,
+            )
+        painter.end()
 
-    def _settle(self, W0, H0):
-        self._img = self._to_photo(self._master)
-        self.label.configure(image=self._img)
-        self.win.geometry(f"{W0}x{H0}+{self._x}+{self._y}")
-        try:
-            self.win.attributes("-alpha", 1.0)
-        except tk.TclError:
-            pass
-        if self._persistent or self._on_timeout is None:
-            return                               # 常驻气泡：不排自动消失的定时器
-        self._job = self.win.after(BUBBLE_MS, self._on_timeout)   # 2.5 秒后自动消失
 
-    def hide(self):
-        self.cancel()
-        self._fade(BUBBLE_FADE_MS // 35)
+# ============================================================
+#  AI 输入框：无边框半透明圆角卡片式顶层 QLineEdit
+# ============================================================
+class ChatInput(QLineEdit):
+    """角色下方的聊天输入框（无边框、半透明、圆角白卡片 + 海军蓝描边）。
 
-    def _fade(self, steps):
-        if self._master is None or steps <= 0:
-            self._master = None
-            try:
-                self.win.attributes("-alpha", 1.0)
-                self.win.withdraw()
-            except tk.TclError:
-                pass
+    · 顶层窗口，能真正拿到键盘焦点：show() 之后 activateWindow() + setFocus()。
+    · 回车 = 发送（submitted 信号），Esc = 取消（cancelled 信号）。
+    """
+
+    submitted = Signal(str)
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        self.setFont(QFont(BUBBLE_TEXT_FAMILY, 11))
+        self.setPlaceholderText(AI_CHAT_PLACEHOLDER)
+        self.setMaxLength(AI_MAX_INPUT_CHARS)
+        self.setMinimumHeight(38)
+        self.setStyleSheet(f"""
+        QLineEdit {{
+            background-color: rgba(255, 255, 255, 0.96);
+            border: 2px solid {BUBBLE_TEXT_COLOR};
+            border-radius: 14px;
+            padding: 7px 14px;
+            color: {BUBBLE_TEXT_COLOR};
+            selection-background-color: #b9cdf5;
+            selection-color: {BUBBLE_TEXT_COLOR};
+        }}
+        QLineEdit:focus {{
+            border: 2px solid #3a55a8;
+            background-color: rgba(255, 255, 255, 1.0);
+        }}
+        """)
+        self.hide()
+
+    def keyPressEvent(self, event):     # noqa: N802
+        key = event.key()
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.submitted.emit(self.text())
+            event.accept()
             return
-        try:
-            self.win.attributes("-alpha", max(0.0, steps / 5.0))
-        except tk.TclError:
-            pass
-        self._job = self.win.after(35, lambda: self._fade(steps - 1))
+        if key == Qt.Key.Key_Escape:
+            self.cancelled.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
-    def is_visible(self) -> bool:
-        return self._master is not None
-
-    def destroy(self):
-        self.cancel()
+    def focus_now(self):
+        """抢焦点：无边框透明窗口必须先 activateWindow 再 setFocus 才吃得到键盘。"""
         try:
-            self.win.destroy()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
         except Exception:
             pass
 
 
-# ---------------- 仿 BongoCat 自绘菜单 ----------------
-class CatMenu:
-    """圆角卡片菜单：悬停高亮、勾选前缀、灰色提示行、二级子菜单，跟随系统深浅色。"""
-
-    def __init__(self, master: tk.Tk, key: str, palette: dict):
-        self.master = master
-        self.key = key
-        self.palette = palette
-        self.font = find_font(MENU_FONT_SIZE)
-        self.probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-        self.panels = []
-        self.items = []
-        self.hover = None
-        self.sub_owner = None
-        self.opened = False
-
-    # ---- 布局 ----
-    @staticmethod
-    def _text(item):
-        return item.get("label", "")
-
-    def _width_for(self, items):
-        width = 0
-        for it in items:
-            if it["type"] == "separator":
-                continue
-            width = max(width, self.probe.textlength(self._text(it), font=self.font))
-            if it["type"] == "submenu":
-                width += 28
-        return int(max(MENU_MIN_W, width + MENU_TEXT_X * 2))
-
-    def _layout(self, items):
-        rows, y = [], MENU_PAD_Y
-        for i, it in enumerate(items):
-            h = MENU_SEP_H if it["type"] == "separator" else MENU_ROW_H
-            rows.append((i, y, y + h, it))
-            y += h
-        return rows, y + MENU_PAD_Y
-
-    def _render(self, index):
-        panel = self.panels[index]
-        items, rows, width, height = panel["items"], panel["rows"], panel["w"], panel["h"]
-        p = self.palette
-        mask = hard_round_mask(width, height, MENU_RADIUS)
-        img = Image.new("RGB", (width, height), hex_rgb(self.key))
-        img.paste(hex_rgb(p["surface"]), (0, 0), mask)
-        d = ImageDraw.Draw(img)
-        d.rounded_rectangle([0, 0, width - 1, height - 1], radius=MENU_RADIUS,
-                            outline=hex_rgb(p["border"]))
-        for (idx, y0, y1, it) in rows:
-            if it["type"] == "separator":
-                yl = y0 + MENU_SEP_H // 2
-                d.line([(12, yl), (width - 13, yl)], fill=hex_rgb(p["border"]), width=1)
-                continue
-            # 子菜单展开时，父行保持高亮（BongoCat 同样如此）
-            hovered = (self.hover == (index, idx)) or (index == 0 and self.sub_owner == idx)
-            hovered = hovered and it["type"] != "hint"
-            if hovered:      # BongoCat: 高亮条 (8, y, w-16, row_h)
-                d.rectangle([8, y0, width - 9, y1], fill=hex_rgb(p["field"]))
-            color = p["muted"] if it["type"] == "hint" else (p["accent"] if hovered else p["text"])
-            text = self._text(it)
-            bbox = d.textbbox((0, 0), text, font=self.font)
-            ty = y0 + (MENU_ROW_H - (bbox[3] - bbox[1])) // 2 - bbox[1]
-            d.text((MENU_TEXT_X, ty), text, font=self.font, fill=hex_rgb(color))
-            if it.get("checked"):       # 对勾用折线画，避免字体缺字变成方框
-                cy = y0 + MENU_ROW_H // 2
-                d.line([(MENU_TEXT_X - 12, cy), (MENU_TEXT_X - 8, cy + 4),
-                        (MENU_TEXT_X - 3, cy - 5)], fill=hex_rgb(color), width=2,
-                       joint="curve")
-            if it["type"] == "submenu":     # 用多边形画箭头，不依赖字体是否有该字形
-                cy = y0 + MENU_ROW_H // 2
-                d.polygon([(width - 22, cy - 4), (width - 22, cy + 4), (width - 14, cy)],
-                          fill=hex_rgb(color))
-        return img
-
-    def _refresh(self):
-        for i, panel in enumerate(self.panels):
-            panel["image"] = ImageTk.PhotoImage(self._render(i))
-            panel["label"].configure(image=panel["image"])
-
-    def _make_panel(self, index, items, width, height, rows):
-        win = tk.Toplevel(self.master)
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        try:
-            win.attributes("-transparentcolor", self.key)
-        except tk.TclError:
-            pass
-        win.configure(bg=self.key)
-        label = tk.Label(win, bd=0, highlightthickness=0, bg=self.key)
-        label.pack()
-        panel = {"win": win, "label": label, "items": items, "rows": rows,
-                 "w": width, "h": height, "x": 0, "y": 0, "image": None}
-        self.panels.insert(index, panel)
-        panel["image"] = ImageTk.PhotoImage(self._render(index))
-        label.configure(image=panel["image"])
-        return panel
-
-    # ---- 弹出 / 关闭 ----
-    def popup(self, x, y, items):
-        self.close()
-        self.items = items
-        self.hover = None
-        self.sub_owner = None
-        width = self._width_for(items)
-        rows, height = self._layout(items)
-        panel = self._make_panel(0, items, width, height, rows)
-        sw, sh = self.master.winfo_screenwidth(), self.master.winfo_screenheight()
-        panel["x"] = min(max(int(x), 4), max(4, sw - width - 4))
-        panel["y"] = min(max(int(y), 4), max(4, sh - height - 4))
-        panel["win"].geometry(f"{width}x{height}+{panel['x']}+{panel['y']}")
-        panel["win"].deiconify()
-        panel["win"].lift()
-        self.opened = True
-        win = panel["win"]
-        win.bind("<Motion>", self._on_motion)
-        win.bind("<ButtonPress-1>", self._on_click)
-        win.bind("<ButtonPress-3>", self._on_click)
-        win.bind("<Escape>", lambda e: self.close())
-        win.update_idletasks()
-        try:
-            win.grab_set_global()      # 全局抓取：面板外点击也能收到，用来关闭菜单
-        except tk.TclError:
-            pass
-        try:
-            win.focus_force()
-        except tk.TclError:
-            pass
-
-    def close(self):
-        self.opened = False
-        self.hover = None
-        self.sub_owner = None
-        for panel in self.panels:
-            try:
-                panel["win"].grab_release()
-            except Exception:
-                pass
-            try:
-                panel["win"].destroy()
-            except Exception:
-                pass
-        self.panels = []
-
-    # ---- 命中判定 ----
-    def _panel_at(self, xr, yr):
-        for i in range(len(self.panels) - 1, -1, -1):
-            p = self.panels[i]
-            if p["x"] <= xr < p["x"] + p["w"] and p["y"] <= yr < p["y"] + p["h"]:
-                return i
-        return None
-
-    def _row_at(self, index, yr):
-        ry = yr - self.panels[index]["y"]
-        for (idx, y0, y1, _it) in self.panels[index]["rows"]:
-            if y0 <= ry < y1:
-                return idx
-        return None
-
-    def _set_hover(self, value):
-        if value == self.hover:
-            return
-        self.hover = value
-        self._refresh()
-
-    def _open_submenu(self, owner):
-        if self.sub_owner == owner and len(self.panels) > 1:
-            return
-        self._close_submenu()
-        sub_items = self.items[owner]["items"]
-        width = self._width_for(sub_items)
-        rows, height = self._layout(sub_items)
-        panel = self._make_panel(1, sub_items, width, height, rows)
-        parent = self.panels[0]
-        row = next(r for r in parent["rows"] if r[0] == owner)
-        sw, sh = self.master.winfo_screenwidth(), self.master.winfo_screenheight()
-        x = parent["x"] + parent["w"] + 2
-        if x + width > sw - 4:
-            x = parent["x"] - width - 2
-        y = parent["y"] + row[1]
-        panel["x"] = min(max(x, 4), max(4, sw - width - 4))
-        panel["y"] = min(max(y, 4), max(4, sh - height - 4))
-        panel["win"].geometry(f"{width}x{height}+{panel['x']}+{panel['y']}")
-        panel["win"].deiconify()
-        panel["win"].lift()
-        self.sub_owner = owner
-
-    def _close_submenu(self):
-        while len(self.panels) > 1:
-            panel = self.panels.pop()
-            try:
-                panel["win"].destroy()
-            except Exception:
-                pass
-        self.sub_owner = None
-
-    # ---- 事件 ----
-    def _on_motion(self, e):
-        if not self.opened:
-            return
-        index = self._panel_at(e.x_root, e.y_root)
-        if index is None:
-            return                       # 面板之间的空隙：保持现状，避免子菜单闪烁
-        idx = self._row_at(index, e.y_root)
-        item = self.panels[index]["items"][idx] if idx is not None else None
-        if index == 0 and item and item["type"] == "submenu":
-            self._set_hover((0, idx))
-            self._open_submenu(idx)
-            return
-        self._set_hover((index, idx) if idx is not None else None)
-        if index == 0 and self.sub_owner is not None and idx != self.sub_owner:
-            self._close_submenu()
-
-    def _on_click(self, e):
-        if not self.opened:
-            return
-        index = self._panel_at(e.x_root, e.y_root)
-        if index is None:
-            self.close()
-            return
-        idx = self._row_at(index, e.y_root)
-        if idx is None:
-            return
-        item = self.panels[index]["items"][idx]
-        if item["type"] in ("separator", "hint", "submenu"):
-            return
-        command = item.get("command")
-        self.close()
-        if command:
-            self.master.after(10, command)
-
-
-# ---------------- 番茄钟：倒计时由 PySide6 的 QTimer 驱动 ----------------
+# ============================================================
+#  番茄钟：主线程里的普通 QTimer，按真实时间差倒计时
+# ============================================================
 class Pomodoro:
-    """QTimer 负责倒计时，但 Qt 事件循环不自己跑，
-    而是由 Tk 的 after 定期调用 pump()（processEvents）带动。
-    两个框架共用同一个线程、谁都不阻塞谁，所以界面绝不会卡死。
-    """
+    """QTimer 驱动，但剩余时间用 time.monotonic() 的真实增量扣减，
+    定时器抖动 / 晚点都不会让倒计时跑偏。Qt 事件循环天然转着，不用再泵。"""
 
-    def __init__(self, qt_app, on_tick, on_finish):
-        self.qt_app = qt_app
+    def __init__(self, on_tick, on_finish, parent=None):
         self.on_tick = on_tick
         self.on_finish = on_finish
         self.running = False
         self.remaining = 0.0
         self._stamp = 0.0
-        self.timer = QTimer()
+        self.timer = QTimer(parent)
         self.timer.setInterval(POMODORO_TICK_MS)
         self.timer.timeout.connect(self._tick)
 
@@ -935,7 +866,6 @@ class Pomodoro:
 
     def _tick(self):
         now = time.monotonic()
-        # 用真实时间差推进，定时器抖动/晚点都不会让倒计时跑偏
         self.remaining -= (now - self._stamp)
         self._stamp = now
         if self.remaining <= 0.0:
@@ -949,572 +879,309 @@ class Pomodoro:
     def _emit(self):
         self.on_tick(self.remaining)
 
-    def pump(self):
-        """在 Tk 的 after 回调里调用，让 QTimer 有机会触发。"""
-        self.qt_app.processEvents()
-
 
 def format_clock(seconds):
     seconds = max(0, int(math.ceil(seconds)))
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
-# ---------------- 主程序 ----------------
-class DesktopPet:
-    def __init__(self, root: tk.Tk, frames, durations, box):
-        self.root = root
-        self.frames = frames
-        self.durations = durations
-        self.base_w, self.base_h = frames[0].size
+# 需要触发「重新按物理分辨率渲染」的 Qt 事件
+_DPR_EVENTS = {QEvent.Type.ScreenChangeInternal}
+for _name in ("DevicePixelRatioChange", "ScreenChange"):
+    _val = getattr(QEvent.Type, _name, None)
+    if _val is not None:
+        _DPR_EVENTS.add(_val)
 
-        # 角色在图片中的实际位置（用于把气泡放到头顶）
-        self.head_cx = ((box[0] + box[2]) / 2) / self.base_w
+
+# ============================================================
+#  主窗口：无边框、逐像素透明的桌面宠物
+# ============================================================
+class DesktopPet(QLabel):
+    """角色本体。
+
+    · basePos   —— 拖动 / 换大小只改这个（角色“站”的位置）
+    · jumpOffset —— 唯一的动画：左键点击时的弹跳（空闲时恒为 0，窗口纹丝不动）
+
+    位置永远 = basePos + (0, bounceOffset + jumpOffset)；没有呼吸动画，
+    所以不做任何操作时窗口是绝对静止的（A1 要求）。
+    """
+
+    def __init__(self, image_path: str = IMAGE_PATH):
+        super().__init__(None)
+
+        # ---------- 窗口：真·逐像素透明 ----------
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setWindowTitle("DesktopPet")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setMouseTracking(True)
+
+        # ---------- 素材 ----------
+        self.source = load_image(image_path)
+        self.base_w, self.base_h = self.source.size
+        box = content_box(self.source)
+        self.head_cx = ((box[0] + box[2]) / 2) / self.base_w     # 头顶中心（比例）
         self.head_top_ratio = box[1] / self.base_h
 
-        self.key_rgb = tuple(int(TRANSPARENT_KEY.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
-
-        root.overrideredirect(True)
-        root.attributes("-topmost", True)
-        try:
-            root.attributes("-transparentcolor", TRANSPARENT_KEY)
-            root.attributes("-toolwindow", True)
-        except tk.TclError:
-            pass
-        root.configure(bg=TRANSPARENT_KEY)
-        root.title("DesktopPet")
-
-        self.label = tk.Label(root, bd=0, highlightthickness=0, bg=TRANSPARENT_KEY)
-        self.label.pack()
-
-        self.bubble = Bubble(root, TRANSPARENT_KEY)
-
-        self.images = []
-        self.idx = 0
+        # ---------- 状态 ----------
         self.scale = 1.0
-        self.anim_job = None
-        self.press = None
-        self.moved = False
-        self.last_line = None
-        self.paused = False
-        self.rest_idx = centered_frame_index(frames)   # 人物居中那一帧
-        self.palette = THEME_DARK if system_prefers_dark() else THEME_LIGHT
         self.opacity = 1.0
         self.topmost = True
+        self.paused = False                 # 保留字段（菜单项已移除），不再影响空闲位置
+        self.moved = False
+        self.last_line = None
+        self.press = None
+        self._jump = 0.0
+        self._teardown = False
+        self.menu = None
+        self.palette = THEME_DARK if system_prefers_dark() else THEME_LIGHT
+        self._screen_connected = False
 
-        # 弹性 / 音效 / 番茄钟状态
-        self.bouncing = False
-        self._squish = [1.0, 1.0]
-        self._squish_plan = None
-        self._squish_frame = None
-        self._squish_img = None
-        self._squish_anchor_cx = 0
-        self._squish_anchor_bottom = 0
-        self.bounce_job = None
-        self.alarm_job = None
-        self.pump_job = None
-        self.alarm_left = 0
-        self.pomo_visible = False
+        # 番茄钟状态机
+        self.pomo_state = POMO_IDLE
+        self.pomo_visible = False           # True ⇔ 番茄钟未处于 IDLE（气泡归倒计时）
+        self._pomo_first = True
 
+        # AI 聊天状态
+        self.ai_typing_ms = AI_TYPING_MS
+        self.chat_open = False
+        self._chat_thread = None
+        self._history = []                  # 滚动窗口：最多 AI_HISTORY_TURNS 轮
+        self._type_full = ""
+        self._type_pos = 0
+
+        # ---------- 点击弹跳动画（唯一的动画） ----------
+        self.jump_anim = QPropertyAnimation(self, b"jumpOffset", self)
+        self.jump_anim.setDuration(JUMP_MS)
+        self.jump_anim.setEasingCurve(QEasingCurve.Type.OutQuad)
+        for pos, value in JUMP_KEYS:
+            self.jump_anim.setKeyValueAt(pos, float(value))
+
+        # ---------- 配置（pet_config.json） ----------
         cfg = self._load_config()
-        self.scale = float(cfg.get("scale") or self._default_scale())
+        self.scale = min(max(float(cfg.get("scale") or self._default_scale()),
+                             MIN_SCALE), MAX_SCALE)
         self.opacity = min(max(float(cfg.get("opacity") or 1.0), MIN_OPACITY), 1.0)
         self.sound = Sound(int(cfg.get("volume", SOUND_VOLUME_DEFAULT)))
-        self._rebuild()
+        self.volume = self.sound.volume
+
+        # ---- 亲密值：启动结算（幂等） ----
+        self._affection_penalty = settle_affection(cfg)
+        self.affection = clamp_affection(cfg.get("affection", AFFECTION_DEFAULT))
+        self.affection_date = cfg.get("affection_date")
+        self.clicked_today = bool(cfg.get("clicked_today"))
+        self.chatted_today = bool(cfg.get("chatted_today"))
+        self._chat_last_error = None
+
+        # ---------- AI config.json（只放 Key，和宠物状态分开） ----------
+        ensure_ai_config(CONFIG_PATH)
+        self.ai_config = load_ai_config(CONFIG_PATH)
+
+        # ---------- 番茄钟 ----------
+        self.pomodoro = Pomodoro(self._on_pomodoro_tick, self._on_pomodoro_finish, self)
+
+        # ---------- 气泡 ----------
+        self.bubble = BubbleLabel(None)
+        self.bubble_fade = QPropertyAnimation(self.bubble, b"fadeOpacity", self)
+        self._fade_hides_bubble = False
+        self.bubble_fade.finished.connect(self._after_fade)
+
+        # ---------- 定时器 ----------
+        self.hide_bubble_job = QTimer(self)
+        self.hide_bubble_job.setSingleShot(True)
+        self.hide_bubble_job.timeout.connect(self._on_bubble_timeout)
+
+        self.anim_job = QTimer(self)
+        self.anim_job.setInterval(120)
+        self.anim_job.timeout.connect(self.tick)
+
+        self.alarm_job = QTimer(self)       # 响铃重复（不自停！）
+        self.alarm_job.setSingleShot(True)
+        self.alarm_job.timeout.connect(self._alarm_tick)
+
+        self.type_job = QTimer(self)        # 打字机：QTimer 驱动，绝不用 time.sleep
+        self.type_job.setSingleShot(True)
+        self.type_job.timeout.connect(self._type_tick)
+
+        self.chat_idle_job = QTimer(self)   # 输入框长时间没人理 → 自动收起
+        self.chat_idle_job.setSingleShot(True)
+        self.chat_idle_job.timeout.connect(self.cancel_chat_input)
+
+        # ---------- AI 输入框 ----------
+        self.chat_input = ChatInput(None)
+        self.chat_input.submitted.connect(self.send_chat_message)
+        self.chat_input.cancelled.connect(self.cancel_chat_input)
+        # 打字也算「操作」，每次都重置 15 秒空闲计时
+        self.chat_input.textChanged.connect(self._on_chat_typed)
+
+        # ---------- 尺寸 / 位置 / 显示 ----------
+        self._apply_scale()
         self._place_window(cfg.get("x"), cfg.get("y"))
         self._apply_opacity()
+        self._save_config()                 # 把启动结算结果立刻落盘
+        self.show()
+        self.anim_job.start()
 
-        qt_app = None
-        if QCoreApplication is not None:
-            qt_app = QCoreApplication.instance() or QCoreApplication([])
-        self.pomodoro = Pomodoro(qt_app, self._on_pomodoro_tick, self._on_pomodoro_finish) \
-            if qt_app is not None else None
+        # ≥70 亲密度：启动约 1.2 秒后主动关心一句
+        QTimer.singleShot(AFFECTION_GREETING_DELAY_MS, self._maybe_greet)
 
-        self.menu = CatMenu(root, TRANSPARENT_KEY, self.palette)
-        self.bubble.bind_click(self.on_bubble_click)
-        for w in (root, self.label):
-            w.bind("<ButtonPress-1>", self.on_press)
-            w.bind("<B1-Motion>", self.on_drag)
-            w.bind("<ButtonRelease-1>", self.on_release)
-            w.bind("<Button-3>", self.on_right_click)
-            w.bind("<MouseWheel>", self.on_wheel)
-        root.bind("<Escape>", lambda e: self.quit())
+    # ============================================================
+    #  自定义 Qt Property —— 动画只写这两个浮点，再由它们统一 move()
+    # ============================================================
+    def _get_breathe(self):
+        """保留这个 Property 只为兼容老调用方；恒为 0，空闲时窗口一动不动。"""
+        return 0.0
 
-        self.tick()
+    def _set_breathe(self, _value):
+        self._apply_position()
 
-    # ---------- 配置 ----------
-    def _default_scale(self):
-        h = self.root.winfo_screenheight()
-        target = min(max(h * 0.30, 160), 340)
-        return min(max(target / self.base_h, MIN_SCALE), MAX_SCALE)
+    def _get_jump(self):
+        return self._jump
 
+    def _set_jump(self, value):
+        self._jump = float(value)
+        self._apply_position()
+
+    breatheOffset = Property(float, _get_breathe, _set_breathe)
+    jumpOffset = Property(float, _get_jump, _set_jump)
+
+    def _apply_position(self):
+        """唯一的落点计算：basePos + (0, jumpOffset)。"""
+        if not hasattr(self, "base_pos"):
+            return
+        offset = int(round(self._jump))
+        self.move(self.base_pos.x(), self.base_pos.y() + offset)
+
+    # ---------- 配置（读-改-写，保留用户自定义键） ----------
     def _load_config(self):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(PET_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
 
     def _save_config(self):
+        data = self._load_config()          # 先读回来，image 之类的用户键不能被抹掉
+        data.update({
+            "scale": round(self.scale, 4),
+            "opacity": round(self.opacity, 3),
+            "volume": int(self.sound.volume),
+            "x": self.base_pos.x(),
+            "y": self.base_pos.y(),
+            "affection": int(self.affection),
+            "affection_date": self.affection_date,
+            "clicked_today": bool(self.clicked_today),
+            "chatted_today": bool(self.chatted_today),
+        })
         try:
-            data = self._load_config()      # 先读回来，保留用户自己写的键（例如 image）
-            data.update({
-                "scale": round(self.scale, 4),
-                "opacity": round(self.opacity, 3),
-                "volume": int(self.sound.volume),
-                "x": self.root.winfo_x(),
-                "y": self.root.winfo_y(),
-            })
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            with open(PET_CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
 
-    # ---------- 尺寸 ----------
-    def _rebuild(self):
+    # ---------- 尺寸 / 位置 ----------
+    def _default_scale(self):
+        screen = self._screen_rect()
+        target = min(max(screen.height() * 0.30, 160), 340)
+        return min(max(target / self.base_h, MIN_SCALE), MAX_SCALE)
+
+    @staticmethod
+    def _screen_rect():
+        app = QApplication.instance()
+        screen = app.primaryScreen() if app else None
+        return screen.availableGeometry() if screen else QRect(0, 0, 1280, 720)
+
+    def _scaled_size(self):
         w = max(24, int(round(self.base_w * self.scale)))
         h = max(24, int(round(self.base_h * self.scale)))
-        images = []
-        for f in self.frames:
-            r = f.resize((w, h), Image.LANCZOS)
-            alpha = r.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
-            bg = Image.new("RGB", (w, h), self.key_rgb)
-            bg.paste(r, (0, 0), alpha)
-            images.append(ImageTk.PhotoImage(bg))
-        self.images = images
-        if self.idx >= len(images):
-            self.idx = 0
-        self.label.configure(image=self.images[self.idx])
-        self.root.geometry(f"{w}x{h}")
+        return w, h
+
+    def _dpr(self) -> float:
+        try:
+            d = float(self.devicePixelRatioF())
+        except Exception:
+            d = 1.0
+        return d if d > 0 else 1.0
+
+    def _render_character(self):
+        """★ 角色图按物理分辨率渲染：PIL LANCZOS 放大到 w*dpr，再 setDevicePixelRatio。"""
+        w, h = self._scaled_size()
+        self._pixmap = render_physical(self.source, w, h, self._dpr())
+
+    def _apply_scale(self):
+        w, h = self._scaled_size()
+        self._render_character()
+        self._rebuild_faded()
+        self.resize(w, h)
+        self.update()
+
+    def _rebuild_faded(self):
+        """按当前不透明度做一张预乘好的 pixmap（尺寸/DPR 和角色图一致）。"""
+        pm = getattr(self, "_pixmap", None)
+        if pm is None or pm.isNull():
+            self._pixmap_faded = None
+            return
+        if self.opacity >= 0.999:
+            self._pixmap_faded = None
+            return
+        dpr = pm.devicePixelRatio() or 1.0
+        faded = QPixmap(pm.width(), pm.height())
+        faded.fill(Qt.GlobalColor.transparent)
+        faded.setDevicePixelRatio(dpr)
+        p = QPainter(faded)
+        p.setRenderHints(QPainter.RenderHint.SmoothPixmapTransform
+                         | QPainter.RenderHint.Antialiasing)
+        p.setOpacity(self.opacity)
+        p.drawPixmap(0, 0, pm)
+        p.end()
+        self._pixmap_faded = faded
 
     def set_scale(self, scale, keep_center=True):
         scale = min(max(scale, MIN_SCALE), MAX_SCALE)
         if abs(scale - self.scale) < 1e-4:
             return
-        old_w, old_h = self.root.winfo_width(), self.root.winfo_height()
-        x, y = self.root.winfo_x(), self.root.winfo_y()
+        old_w, old_h = self.width(), self.height()
         self.scale = scale
-        self._rebuild()
+        self._apply_scale()
+        self._apply_position()
         if keep_center:
-            new_w, new_h = self.root.winfo_width(), self.root.winfo_height()
-            x += (old_w - new_w) // 2
-            y += (old_h - new_h)      # 底部对齐，像站原地长高
-        self._move(x, y)
-        self._reposition_pomodoro()   # 大小变了，番茄钟气泡重新贴回头顶
+            # 底部中心不动：尺寸变了横向居中、底边对齐，像站原地长高
+            w, h = self.width(), self.height()
+            self.set_base_pos(self.base_pos.x() + (old_w - w) // 2,
+                              self.base_pos.y() + (old_h - h))
+        self._reposition_pomodoro()
+        self._reposition_chat_input()
 
-    def _move(self, x, y):
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        w, h = self.root.winfo_width(), self.root.winfo_height()
-        x = min(max(int(x), -w // 3), sw - w // 2)
-        y = min(max(int(y), -h // 4), sh - h // 3)
-        self.root.geometry(f"+{x}+{y}")
+    def set_base_pos(self, x, y, clamp=True):
+        """拖动唯一入口：只改 basePos，动画偏移由 setter 叠加。"""
+        screen = self._screen_rect()
+        w, h = self.width(), self.height()
+        if clamp:
+            x = min(max(int(x), -w // 3), max(4, screen.width() - w // 2))
+            y = min(max(int(y), -h // 4), max(4, screen.height() - h // 3))
+        self.base_pos = QPoint(int(x), int(y))
+        self._apply_position()
 
     def _place_window(self, x, y):
-        self.root.update_idletasks()
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        w, h = self.root.winfo_width(), self.root.winfo_height()
+        screen = self._screen_rect()
+        w, h = self.width(), self.height()
         if x is None or y is None:
-            x, y = sw - w - 60, sh - h - 90
-        self._move(x, y)
-
-    # ---------- 动画 ----------
-    def tick(self):
-        if self.paused:                     # 暂停后不再排新的定时器
-            self.anim_job = None
-            return
-        if self.images:
-            self.idx = (self.idx + 1) % len(self.images)
-            if not self._squish_locked():   # 形变期间由弹性动画接管画面
-                self.label.configure(image=self.images[self.idx])
-            delay = self.durations[self.idx] if self.idx < len(self.durations) else 60
-        else:
-            delay = 100
-        self.anim_job = self.root.after(delay, self.tick)
-
-    # ---------- 点击弹性：按下压缩 → 松开回弹（鲸鱼挂件的做法） ----------
-    def _squish_locked(self):
-        return (self.bouncing
-                or abs(self._squish[0] - 1.0) > 0.004
-                or abs(self._squish[1] - 1.0) > 0.004)
-
-    def squish(self, target):
-        """把当前形变以 220ms 弹簧过渡到 target=(scaleY, scaleX)。"""
-        if not self.images:
-            return
-        if self.bounce_job:
-            try:
-                self.root.after_cancel(self.bounce_job)
-            except Exception:
-                pass
-            self.bounce_job = None
-        if abs(target[0] - self._squish[0]) < 1e-3 and abs(target[1] - self._squish[1]) < 1e-3:
-            return
-        self.root.update_idletasks()
-        self._squish_frame = self.frames[self.idx % len(self.frames)]
-        self._squish_anchor_cx = self.root.winfo_x() + self.root.winfo_width() // 2
-        self._squish_anchor_bottom = self.root.winfo_y() + self.root.winfo_height()
-        self.bouncing = True
-        self._squish_plan = (tuple(self._squish), tuple(target), 0)
-        self._squish_tick()
-
-    def _squish_tick(self):
-        if not self._squish_plan:
-            self.bouncing = False
-            return
-        start, target, step = self._squish_plan
-        if step > SQUISH_STEPS:
-            self._squish = [target[0], target[1]]
-            self._squish_plan = None
-            self._end_squish()
-            return
-        p = spring_ease(step / SQUISH_STEPS)      # 同一条 cubic-bezier(.34,1.56,.64,1)
-        sy = start[0] + (target[0] - start[0]) * p
-        sx = start[1] + (target[1] - start[1]) * p
-        self._squish = [sy, sx]
-        self._show_squished(self._squish_frame, sy, sx)
-        self._squish_plan = (start, target, step + 1)
-        self.bounce_job = self.root.after(max(16, SQUISH_MS // SQUISH_STEPS), self._squish_tick)
-
-    def _show_squished(self, frame, sy, sx):
-        w = max(24, int(round(self.base_w * self.scale * sx)))
-        h = max(24, int(round(self.base_h * self.scale * sy)))
-        r = frame.resize((w, h), Image.LANCZOS)
-        alpha = r.getchannel("A").point(lambda v: 255 if v >= 128 else 0)
-        bg = Image.new("RGB", (w, h), self.key_rgb)
-        bg.paste(r, (0, 0), alpha)
-        self._squish_img = ImageTk.PhotoImage(bg)   # 必须留引用，否则被 GC
-        self.label.configure(image=self._squish_img)
-        # transform-origin: 50% 100% —— 底部中心不动
-        self.root.geometry(
-            f"{w}x{h}+{self._squish_anchor_cx - w // 2}+{self._squish_anchor_bottom - h}"
-        )
-
-    def _end_squish(self):
-        self.bouncing = False
-        self.bounce_job = None
-        if self._squish_locked():          # 还压着（按住不放）→ 保持形变
-            return
-        self._restore_normal_frame()
-
-    def _restore_normal_frame(self):
-        self._squish = [1.0, 1.0]
-        w = max(24, int(round(self.base_w * self.scale)))
-        h = max(24, int(round(self.base_h * self.scale)))
-        self.label.configure(image=self.images[self.idx])
-        self.root.geometry(f"{w}x{h}+{self._squish_anchor_cx - w // 2}"
-                           f"+{self._squish_anchor_bottom - h}")
-
-    def reset_squish(self):
-        """拖动前先恢复原状，免得缩放和位移互相打架。"""
-        if self.bounce_job:
-            try:
-                self.root.after_cancel(self.bounce_job)
-            except Exception:
-                pass
-            self.bounce_job = None
-        self._squish_plan = None
-        self.bouncing = False
-        if self.images and self._squish_locked():
-            self._restore_normal_frame()
-        self._squish = [1.0, 1.0]
-
-    # ---------- 暂停 / 继续 ----------
-    def toggle_pause(self):
-        self.resume() if self.paused else self.pause()
-
-    def pause(self):
-        """定格在人物居中的那一帧，同时取消后台动画定时器。"""
-        if self.paused or len(self.images) <= 1:
-            return
-        if self.anim_job:
-            try:
-                self.root.after_cancel(self.anim_job)
-            except Exception:
-                pass
-            self.anim_job = None
-        self.paused = True
-        self.idx = self.rest_idx % len(self.images)
-        self.reset_squish()
-        self.label.configure(image=self.images[self.idx])
-
-    def resume(self):
-        if not self.paused:
-            return
-        self.paused = False
-        self.tick()
-
-    # ---------- 鼠标 ----------
-    def on_press(self, e):
-        self.press = (e.x_root, e.y_root, self.root.winfo_x(), self.root.winfo_y(), time.monotonic())
-        self.moved = False
-        self.sound.play("press")            # 鲸鱼挂件：按下先响一声
-        self.squish(SQUISH_DOWN)            # 按下 → 压扁（底部中心为原点）
-
-    def on_drag(self, e):
-        if not self.press:
-            return
-        px, py, wx, wy, _ = self.press
-        dx, dy = e.x_root - px, e.y_root - py
-        if not self.moved and (abs(dx) > DRAG_THRESHOLD or abs(dy) > DRAG_THRESHOLD):
-            self.moved = True
-            self.reset_squish()             # 开始拖了就先恢复原状
-            if not self.pomo_visible:
-                self.bubble.hide()
-        if self.moved:
-            self._move(wx + dx, wy + dy)
-            self._reposition_pomodoro()     # 番茄钟气泡跟着角色走
-
-    def on_release(self, e):
-        if not self.press:
-            return
-        _, _, _, _, t0 = self.press
-        quick = (time.monotonic() - t0) <= CLICK_MAX_SECONDS
-        self.press = None
-        self.sound.play("release")          # 松开回弹音
-        self.squish(SQUISH_UP)              # 松开 → 弹回原状
-        if not self.moved and quick:
-            self.on_pet_click()
-
-    def on_pet_click(self):
-        """点角色：换台词；番茄钟没在跑的时候才换，避免和倒计时打架。"""
-        if not self.pomo_visible:
-            self.say_random()
-
-    def on_bubble_click(self, _event=None):
-        """点气泡：换下一句台词。番茄钟期间保持显示剩余时间，不乱变。"""
-        if self.pomo_visible:
-            return
-        self.sound.play("release")
-        self.say_random()
-
-    def on_right_click(self, e):
-        self.bubble.hide()
-        self.menu.popup(e.x_root, e.y_root, self._menu_items())
-
-    def on_wheel(self, e):
-        if e.state & 0x0004:        # Ctrl + 滚轮 → 调不透明度
-            self.set_opacity(self.opacity + (0.05 if e.delta > 0 else -0.05))
-        else:                       # 滚轮 → 调大小
-            self.set_scale(self.scale * (1.08 if e.delta > 0 else 1 / 1.08))
-
-    # ---------- 台词气泡 ----------
-    def say_random(self):
-        if self.pomo_visible:      # 番茄钟期间气泡属于倒计时，不能被台词顶掉
-            return
-        pool = [ln for ln in LINES if ln != self.last_line] or LINES
-        self.last_line = random.choice(pool)
-        self.say(self.last_line)
-
-    def say(self, text):
-        master, x, y, tail_ratio = self._layout_bubble(text)
-        self.bubble.show(master, x, y, self.bubble.hide, tail_ratio=tail_ratio)
-
-    def _layout_bubble(self, text):
-        """算出气泡该摆在哪（头顶优先，放不下自动翻到下方/贴边），返回成品图与坐标。"""
-        root = self.root
-        root.update_idletasks()
-        pw, ph = root.winfo_width(), root.winfo_height()
-        px, py = root.winfo_x(), root.winfo_y()
-        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-
-        head_cx = px + pw * self.head_cx
-        head_top = py + ph * self.head_top_ratio
-
-        # 先按“尾巴朝下”量一遍尺寸，再按实际落点重画尾巴位置
-        probe = self.bubble.build(text, 0.5, True)
-        W, H = probe.size
-
-        x = head_cx - W / 2
-        y = head_top - 8 - H
-        tail_down = True
-        if y < 4:                     # 头顶放不下 → 改到角色下方，尾巴朝上
-            tail_down = False
-            y = py + ph + 6
-            if y + H > sh - 4:
-                y = max(4, sh - H - 4)
-
-        x = min(max(x, 4), max(4, sw - W - 4))
-        y = min(max(y, 4), max(4, sh - H - 4))
-
-        tail_ratio = (head_cx - x) / W if W else 0.5
-        return self.bubble.build(text, tail_ratio, tail_down), int(x), int(y), tail_ratio
-
-    # ---------- 番茄钟 ----------
-    def start_pomodoro(self):
-        if self.pomodoro is None or self.pomodoro.running:
-            return
-        self.pomo_visible = True
-        self._pomo_first = True
-        self.pomodoro.start(POMODORO_MINUTES)
-        self._pump_qt()
-
-    def stop_pomodoro(self):
-        self._cancel_alarm()
-        if self.pomodoro is not None:
-            self.pomodoro.stop()
-        self.pomo_visible = False
-        self.bubble.hide()
-
-    def _pump_qt(self):
-        """让 QTimer 有机会触发；番茄钟跑着的时候才需要泵。"""
-        if self.pomodoro is not None and self.pomodoro.running:
-            self.pomodoro.pump()
-            self.pump_job = self.root.after(30, self._pump_qt)
-        else:
-            self.pump_job = None
-
-    def _pomodoro_text(self, remaining):
-        return f"🍅 专注中 {format_clock(remaining)}"
-
-    def _on_pomodoro_tick(self, remaining):
-        if not self.pomo_visible:
-            return
-        self._show_pomodoro_bubble(self._pomodoro_text(remaining))
-
-    def _on_pomodoro_finish(self):
-        self.sound.play("chime")
-        self.alarm_left = ALARM_SECONDS
-        self._show_pomodoro_bubble("🍅 时间到啦，休息一下～")
-        self._alarm_tick()
-
-    def _alarm_tick(self):
-        if self.alarm_left <= 0:
-            self.alarm_job = None
-            self.pomo_visible = False
-            self.bubble.hide()
-            return
-        if self.alarm_left < ALARM_SECONDS:      # 第一声已经在完成时播过
-            self.sound.play("chime")
-        self.alarm_left -= 1
-        self.alarm_job = self.root.after(1000, self._alarm_tick)
-
-    def _cancel_alarm(self):
-        if self.alarm_job:
-            try:
-                self.root.after_cancel(self.alarm_job)
-            except Exception:
-                pass
-            self.alarm_job = None
-        self.alarm_left = 0
-        self.sound.stop()
-
-    def _show_pomodoro_bubble(self, text, first=False):
-        master, x, y, tail_ratio = self._layout_bubble(text)
-        if first or self._pomo_first:
-            self._pomo_first = False
-            self.bubble.show(master, x, y, None, persistent=True, tail_ratio=tail_ratio)
-        else:
-            self.bubble.update_in_place(master, x, y, tail_ratio)
-
-    def _reposition_pomodoro(self):
-        """角色被拖动时，让番茄钟气泡重新贴回头顶。"""
-        if not self.pomo_visible or not self.bubble.is_visible():
-            return
-        if self.pomodoro is not None and self.pomodoro.running:
-            text = self._pomodoro_text(self.pomodoro.remaining)
-        else:
-            text = "🍅 时间到啦，休息一下～"
-        self._show_pomodoro_bubble(text)
-
-    # ---------- 菜单 ----------
-    def _menu_items(self):
-        """按 BongoCat 的菜单逻辑组织：勾选态 + 子菜单 + 灰色提示行。"""
-        cur = self.scale * 100
-        sizes = [
-            {"type": "command", "label": "放大　(+)",
-             "command": lambda: self.set_scale(self.scale * 1.12)},
-            {"type": "command", "label": "缩小　(-)",
-             "command": lambda: self.set_scale(self.scale / 1.12)},
-            {"type": "separator"},
-        ]
-        for name, value in SCALE_PRESETS:
-            pct = int(round(value * 100))
-            sizes.append({
-                "type": "command", "label": f"{name}　{pct}%",
-                "checked": abs(cur - pct) < 5,
-                "command": (lambda v=value: self.set_scale(v)),
-            })
-        sizes += [
-            {"type": "separator"},
-            {"type": "command", "label": "恢复默认大小",
-             "command": lambda: self.set_scale(self._default_scale())},
-            {"type": "hint", "label": "滚轮也可以调整大小"},
-        ]
-
-        cur_op = round(self.opacity * 100)
-        opacity = [
-            {"type": "command", "label": f"{pct}%", "checked": abs(cur_op - pct) < 5,
-             "command": (lambda v=pct: self.set_opacity(v / 100.0))}
-            for pct in OPACITY_PRESETS
-        ]
-        opacity += [
-            {"type": "separator"},
-            {"type": "hint", "label": "Ctrl + 滚轮 也可以调整"},
-        ]
-
-        # ---- 番茄钟 ----
-        if self.pomodoro is None:
-            tomato = [{"type": "hint", "label": "需要 PySide6（pip install PySide6）"}]
-        elif self.pomodoro.running:
-            tomato = [
-                {"type": "command",
-                 "label": f"专注中 {format_clock(self.pomodoro.remaining)}", "checked": True,
-                 "command": None},
-                {"type": "command", "label": "停止番茄钟", "command": self.stop_pomodoro},
-            ]
-        else:
-            tomato = [
-                {"type": "command", "label": f"开始专注（{POMODORO_MINUTES} 分钟）",
-                 "command": self.start_pomodoro},
-                {"type": "hint", "label": "停止番茄钟"},
-            ]
-
-        # ---- 音量 ----
-        volume = [
-            {"type": "command", "label": f"{pct}%", "checked": self.sound.volume == pct,
-             "command": (lambda v=pct: self.set_volume(v))}
-            for pct in VOLUME_PRESETS
-        ]
-        volume += [
-            {"type": "separator"},
-            {"type": "hint", "label": "点击角色和气泡都会响"},
-        ]
-
-        line_item = ({"type": "hint", "label": "换一句台词（番茄钟中不可用）"}
-                     if self.pomo_visible else
-                     {"type": "command", "label": "换一句台词", "command": self.say_random})
-
-        return [
-            {"type": "command", "label": "继续动画" if self.paused else "暂停动画",
-             "command": self.toggle_pause},
-            line_item,
-            {"type": "separator"},
-            {"type": "submenu", "label": "番茄钟", "items": tomato},
-            {"type": "submenu", "label": "窗口大小", "items": sizes},
-            {"type": "submenu", "label": "不透明度", "items": opacity},
-            {"type": "submenu", "label": "音效音量", "items": volume},
-            {"type": "command", "label": "窗口置顶", "checked": self.topmost,
-             "command": self.toggle_topmost},
-            {"type": "separator"},
-            # 延后一点再退出，先让菜单收起，避免 Tcl 报错
-            {"type": "command", "label": "退出",
-             "command": lambda: self.root.after(10, self.quit)},
-        ]
-
-    # ---------- 音量 ----------
-    def set_volume(self, volume):
-        self.sound.set_volume(volume)
-        self.sound.play("release")       # 立即试听
-
-    # ---------- 置顶 / 不透明度 ----------
-    def toggle_topmost(self):
-        self.topmost = not self.topmost
-        self.root.attributes("-topmost", self.topmost)
+            x = screen.x() + screen.width() - w - 60
+            y = screen.y() + screen.height() - h - 90
+        self.set_base_pos(x, y)
 
     def _apply_opacity(self):
-        try:
-            self.root.attributes("-alpha", self.opacity)
-        except tk.TclError:
-            pass
+        self._rebuild_faded()
+        self.setWindowOpacity(self.opacity)
+        self.update()
 
     def set_opacity(self, value):
         value = min(max(value, MIN_OPACITY), 1.0)
@@ -1523,74 +1190,831 @@ class DesktopPet:
         self.opacity = value
         self._apply_opacity()
 
-    # ---------- 退出 ----------
-    def quit(self):
-        for job in (self.anim_job, self.bounce_job, self.alarm_job, self.pump_job):
-            if job:
-                try:
-                    self.root.after_cancel(job)
-                except Exception:
-                    pass
-        self.anim_job = self.bounce_job = self.alarm_job = self.pump_job = None
+    def toggle_topmost(self):
+        self.topmost = not self.topmost
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.topmost)
+        self.show()               # 改窗口 flag 之后必须重新 show 才生效
+
+    # ---------- DPR / 屏幕变化 → 重新按物理分辨率渲染 ----------
+    def _on_dpr_changed(self):
+        if self._teardown:
+            return
+        self._render_character()
+        self._rebuild_faded()
+        self.update()
+        bubble = getattr(self, "bubble", None)
+        if bubble is not None:
+            bubble.rerender()
+
+    def event(self, e):             # noqa: N802
+        try:
+            changed = e.type() in _DPR_EVENTS
+        except Exception:
+            changed = False
+        if changed:
+            QTimer.singleShot(0, self._on_dpr_changed)
+        return super().event(e)
+
+    def showEvent(self, event):     # noqa: N802
+        super().showEvent(event)
+        QTimer.singleShot(0, self._on_dpr_changed)
+        handle = self.windowHandle()
+        if handle is not None and not self._screen_connected:
+            try:
+                handle.screenChanged.connect(lambda *_: self._on_dpr_changed())
+                self._screen_connected = True
+            except Exception:
+                pass
+
+    # ---------- 绘制 ----------
+    def paintEvent(self, event):        # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHints(
+            QPainter.RenderHint.Antialiasing
+            | QPainter.RenderHint.SmoothPixmapTransform
+        )
+        pm = getattr(self, "_pixmap_faded", None) or getattr(self, "_pixmap", None)
+        if pm is not None and not pm.isNull():
+            painter.drawPixmap(0, 0, pm)    # 物理分辨率贴图，1:1 不重采样
+        painter.end()
+
+    # ---------- 原动图逐帧播放的位置（静态 PNG 下是空操作，保留接线） ----------
+    def tick(self):
+        if self.paused or self.anim_job is None:
+            return
+        # 静态 PNG 只有一帧，没有可推进的画面；空闲时也没有任何漂浮/呼吸动画。
+
+    # ---------- 暂停 / 继续（菜单项已移除，仅保留 API） ----------
+    def toggle_pause(self):
+        self.resume() if self.paused else self.pause()
+
+    def pause(self):
+        """现在没有呼吸动画，pause 只是停掉可能正在跑的弹跳并把状态钉住。"""
+        if self.paused:
+            return
+        self.paused = True
+        self.jump_anim.stop()
+        self._jump = 0.0
+        self._apply_position()
+        self.update()
+
+    def resume(self):
+        if not self.paused:
+            return
+        self.paused = False
+
+    # ---------- 点击弹跳（QPropertyAnimation on jumpOffset） ----------
+    def hop(self):
+        """单击弹跳：唯一的动画，左键点击的反馈。"""
+        self.jump_anim.stop()
+        self._jump = 0.0
+        self._apply_position()
+        self.jump_anim.start()
+
+    # ============================================================
+    #  鼠标
+    # ============================================================
+    def mousePressEvent(self, event):        # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.press = (event.globalPosition().toPoint(), self.base_pos, time.monotonic())
+            self.moved = False
+            self.sound.play("press")
+            return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.on_right_click(event)
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):         # noqa: N802
+        if not self.press or not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+        start, base, _ = self.press
+        now = event.globalPosition().toPoint()
+        dx, dy = now.x() - start.x(), now.y() - start.y()
+        if not self.moved and (abs(dx) > DRAG_THRESHOLD or abs(dy) > DRAG_THRESHOLD):
+            self.moved = True
+            if not self.pomo_visible:
+                self.hide_bubble()
+        if self.moved:
+            self.set_base_pos(base.x() + dx, base.y() + dy)
+            self._reposition_pomodoro()
+            self._reposition_chat_input()
+
+    def mouseReleaseEvent(self, event):      # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton or not self.press:
+            super().mouseReleaseEvent(event)
+            return
+        _, _, t0 = self.press
+        quick = (time.monotonic() - t0) <= CLICK_MAX_SECONDS
+        self.press = None
+        self.sound.play("release")
+        if not self.moved and quick:
+            self.handle_click()
+
+    def mouseDoubleClickEvent(self, event):  # noqa: N802
+        self.mousePressEvent(event)
+
+    def wheelEvent(self, event):             # noqa: N802
+        delta = event.angleDelta().y()
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.set_opacity(self.opacity + (0.05 if delta > 0 else -0.05))
+        else:
+            factor = 1.08 if delta > 0 else 1 / 1.08
+            self.set_scale(self.scale * factor)
+        event.accept()
+
+    def keyPressEvent(self, event):          # noqa: N802
+        if event.key() == Qt.Key.Key_Escape:
+            self.quit()
+            return
+        super().keyPressEvent(event)
+
+    # ============================================================
+    #  ★ 点击优先级（详见文件头注释，两者必须保持一致）
+    # ============================================================
+    def handle_click(self):
+        """左键单击的唯一入口，严格按 1→2→3→4 的顺序判断。"""
+        self._settle_day_and_credit_click()          # 附带：今日首次点击 +1
+        self.hop()                                   # 任何情况下都弹跳
+
+        # 1. 正在响铃 → 只关铃 + 进下一阶段，绝不打开 AI / 改写气泡
+        if self.pomo_state in POMO_RINGING_STATES:
+            self.dismiss_alarm()
+            return
+
+        # 2. 输入框已开 → 只重新聚焦，不再开第二个
+        if self.chat_open:
+            self.chat_input.focus_now()
+            return
+
+        # 3. 番茄钟某个阶段正在倒计时 → 只弹跳，气泡继续显示倒计时
+        if self.pomo_state in POMO_RUNNING_STATES:
+            return
+
+        # 4. 否则走 AI 聊天流程
+        self.open_chat_input()
+
+    # 旧名兼容：老代码 / 老测试调用 on_pet_click 的仍然能用
+    def on_pet_click(self):
+        self.handle_click()
+
+    def on_bubble_click(self, _event=None):
+        """气泡是鼠标穿透的，这个入口留给以后需要在气泡上响应点击时用。"""
+        self.sound.play("release")
+        self.handle_click()
+
+    def on_right_click(self, event):
+        # 右键时先收起输入框，否则菜单弹出来输入框还杵在那儿
+        self.close_chat_input()
+        self.hide_bubble()
+        self.show_menu(event.globalPosition().toPoint())
+
+    # ============================================================
+    #  亲密值
+    # ============================================================
+    def _roll_day(self):
+        """跨天（或首次）时先结算，返回本次扣分。"""
+        cfg = {
+            "affection": self.affection,
+            "affection_date": self.affection_date,
+            "clicked_today": self.clicked_today,
+            "chatted_today": self.chatted_today,
+        }
+        penalty = settle_affection(cfg)
+        self.affection = clamp_affection(cfg.get("affection"))
+        self.affection_date = cfg.get("affection_date")
+        self.clicked_today = bool(cfg.get("clicked_today"))
+        self.chatted_today = bool(cfg.get("chatted_today"))
+        if penalty:
+            self._affection_penalty = penalty
+        return penalty
+
+    def _settle_day_and_credit_click(self):
+        self._roll_day()
+        if not self.clicked_today:
+            self.clicked_today = True
+            self.affection = clamp_affection(self.affection + AFFECTION_CLICK_GAIN)
+            self._save_config()
+        return self.affection
+
+    def credit_chat(self):
+        """今日第一条消息 +2（每天只加一次）。"""
+        self._roll_day()
+        if not self.chatted_today:
+            self.chatted_today = True
+            self.affection = clamp_affection(self.affection + AFFECTION_CHAT_GAIN)
+            self._save_config()
+        return self.affection
+
+    def affection_info(self) -> str:
+        return f"亲密值 ❤ {self.affection}/{AFFECTION_MAX}"
+
+    def today_status_info(self) -> str:
+        clicked = "已点击" if self.clicked_today else "未点击"
+        chatted = "已对话" if self.chatted_today else "未对话"
+        return f"今日：{clicked} · {chatted}"
+
+    def _maybe_greet(self):
+        """亲密度够高时，启动后主动关心一句。"""
+        if self._teardown or self.affection < AFFECTION_GREETING_MIN:
+            return
+        if self.pomo_state != POMO_IDLE or self.chat_open:
+            return
+        if self.jump_anim.state() != QAbstractAnimation.State.Stopped:
+            return
+        self.say(random.choice(AFFECTION_GREETINGS))
+
+    # ============================================================
+    #  台词气泡
+    # ============================================================
+    def say_random(self):
+        """遗留接口：随机说一句台词库的话（已不再绑定到点击）。"""
+        if self.pomo_visible:      # 番茄钟期间气泡属于倒计时，不能被台词顶掉
+            return
+        pool = [ln for ln in LINES if ln != self.last_line] or LINES
+        self.last_line = random.choice(pool)
+        self.say(self.last_line)
+
+    def say(self, text):
+        x, y = self._bubble_target()
+        self._show_bubble(text, x, y, persistent=False)
+
+    # ---------- 气泡窗口的显示 / 隐藏 ----------
+    def _bubble_target(self):
+        """气泡中心对准头顶中心，尾巴留一点空隙；贴边时自动收进屏幕。"""
+        screen = self._screen_rect()
+        width = int(max(140, min(360, self.width() * 0.95)))
+        self.bubble.set_bubble_width(width)
+        bw, bh = self.bubble.width(), self.bubble.height()
+        head_cx = self.base_pos.x() + self.width() * self.head_cx
+        head_top = self.base_pos.y() + self.height() * self.head_top_ratio
+        x = head_cx - bw / 2
+        y = head_top - BUBBLE_TAIL_OFFSET - bh
+        if y < screen.y() + 4:                       # 头顶放不下 → 挪到角色下方
+            y = self.base_pos.y() + self.height() + 6
+            if y + bh > screen.y() + screen.height() - 4:
+                y = max(screen.y() + 4, screen.y() + screen.height() - bh - 4)
+        x = min(max(x, screen.x() + 4),
+                max(screen.x() + 4, screen.x() + screen.width() - bw - 4))
+        y = min(max(y, screen.y() + 4),
+                max(screen.y() + 4, screen.y() + screen.height() - bh - 4))
+        return int(x), int(y)
+
+    def show_persistent_bubble(self, text):
+        """常驻气泡：已经在显示就原地换字，不重播淡入（打字机/倒计时用）。"""
+        x, y = self._bubble_target()
+        if self._pomo_first or not self.bubble.isVisible():
+            self._pomo_first = False
+            self._show_bubble(text, x, y, persistent=True)
+        else:
+            self.update_bubble_in_place(text, x, y)
+
+    def _show_bubble(self, text, x, y, persistent=False):
+        self.hide_bubble_job.stop()
+        self.bubble_fade.stop()          # 先停掉可能还在跑的淡出，否则它会把新气泡又拉黑
+        self._fade_hides_bubble = False
+        fade_in = (not self.bubble.isVisible()) or self.bubble.fadeOpacity < 0.99
+        shown = self.bubble.fadeOpacity if self.bubble.isVisible() else 0.05
+        self.bubble.set_text(text)
+        self.bubble.move(x, y)
+        self.bubble.show()
+        self.bubble.raise_()
+        if fade_in:
+            self.bubble_fade.setDuration(BUBBLE_ANIM_MS)
+            self.bubble_fade.setStartValue(min(0.95, max(0.05, float(shown))))
+            self.bubble_fade.setEndValue(1.0)
+            self.bubble_fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self.bubble_fade.start()
+        if not persistent:
+            self.hide_bubble_job.start(BUBBLE_MS)
+
+    def _after_fade(self):
+        """淡入/淡出动画结束后调用：把值钉死在终点，避免最后一帧被丢掉。"""
+        if self._fade_hides_bubble:
+            self.bubble._set_fade(0.0)
+            self.bubble.hide()
+        else:
+            self.bubble._set_fade(1.0)
+
+    def update_bubble_in_place(self, text, x, y):
+        """原地换内容：不重播弹入动画、不移动窗口锚点（倒计时/打字机用）。"""
+        if not self.bubble.isVisible() or self.bubble.fadeOpacity < 0.99:
+            self._show_bubble(text, x, y, persistent=True)
+            return
+        self.hide_bubble_job.stop()
+        self.bubble_fade.stop()
+        self.bubble.set_text(text)
+        self.bubble.move(x, y)
+        self.bubble.show()
+
+    def hide_bubble(self):
+        self.hide_bubble_job.stop()
+        if not self.bubble.isVisible():
+            return
+        self.bubble_fade.stop()
+        self._fade_hides_bubble = True
+        self.bubble_fade.setDuration(BUBBLE_FADE_MS)
+        self.bubble_fade.setStartValue(float(self.bubble.fadeOpacity))
+        self.bubble_fade.setEndValue(0.0)
+        self.bubble_fade.setEasingCurve(QEasingCurve.Type.InCubic)
+        self.bubble_fade.start()
+
+    def _on_bubble_timeout(self):
+        self.hide_bubble()
+
+    # ============================================================
+    #  ★ AI 聊天（PART C）
+    # ============================================================
+    def open_chat_input(self):
+        """第 4 优先级：气泡给傲娇提示 + 角色下方弹出输入框。"""
+        if self.chat_open:
+            self.chat_input.focus_now()
+            return
+        if self.pomo_state != POMO_IDLE:
+            return
+        self.chat_open = True
+        self._cancel_typing()
+        self.chat_input.clear()
+        self._reposition_chat_input()
+        self.chat_input.focus_now()
+        self.show_persistent_bubble(AI_PROMPT_LINE)
+        self.chat_idle_job.start(AI_CHAT_IDLE_MS)
+
+    def _on_chat_typed(self, _text=None):
+        """输入框里有任何输入都算「操作」，重置 15 秒空闲计时。"""
+        if self.chat_open:
+            self.chat_idle_job.start(AI_CHAT_IDLE_MS)
+
+    def close_chat_input(self, hide_bubble=False):
+        self.chat_idle_job.stop()
+        if self.chat_open:
+            self.chat_open = False
+            try:
+                self.chat_input.hide()
+            except Exception:
+                pass
+        if hide_bubble and not self.pomo_visible:
+            self.hide_bubble()
+
+    def cancel_chat_input(self):
+        """Esc：收起输入框并清空气泡。"""
+        self.close_chat_input(hide_bubble=True)
+
+    def _chat_input_target(self):
+        screen = self._screen_rect()
+        w = int(max(220, min(430, self.width() * 1.05)))
+        h = max(38, self.chat_input.sizeHint().height())
+        cx = self.base_pos.x() + self.width() / 2
+        y = self.base_pos.y() + self.height() + 10
+        x = cx - w / 2
+        x = min(max(x, screen.x() + 4),
+                max(screen.x() + 4, screen.x() + screen.width() - w - 4))
+        y = min(max(y, screen.y() + 4),
+                max(screen.y() + 4, screen.y() + screen.height() - h - 4))
+        return int(x), int(y), w, h
+
+    def _reposition_chat_input(self):
+        if not self.chat_open:
+            return
+        x, y, w, h = self._chat_input_target()
+        self.chat_input.setGeometry(x, y, w, h)
+
+    def send_chat_message(self, text=None):
+        """回车发送：收输入框 → 后台请求 → 打字机显示回复。"""
+        if not self.chat_open:
+            return
+        if text is None:
+            text = self.chat_input.text()
+        text = (text or "").strip()[:AI_MAX_INPUT_CHARS]
+        self.close_chat_input()
+        if not text:
+            self.show_persistent_bubble(AI_ERROR_EMPTY)
+            self.hide_bubble_job.start(BUBBLE_MS)
+            return
+
+        self.credit_chat()                       # 今日首条消息 +2
+        self._history.append({"role": "user", "content": text})
+        self._history = self._history[-AI_HISTORY_TURNS * 2:]
+        messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}] + list(self._history)
+
+        self.chat_idle_job.stop()
+        self._cancel_typing()
+        self.show_persistent_bubble(AI_WAITING_TEXT)
+        self._start_chat_thread(messages)
+
+    def _start_chat_thread(self, messages):
+        cfg = self.ai_config or load_ai_config(CONFIG_PATH)
+        api_key = str(cfg.get("deepseek_api_key") or "").strip()
+        thread = ChatThread(
+            messages, api_key,
+            str(cfg.get("deepseek_base_url") or DEEPSEEK_BASE_URL),
+            str(cfg.get("deepseek_model") or DEEPSEEK_MODEL),
+            self,
+        )
+        thread.replied.connect(self._on_ai_reply)
+        thread.failed.connect(self._on_ai_failed)
+        thread.finished.connect(self._on_chat_thread_done)
+        self._chat_thread = thread
+        thread.start()                           # ★ 非阻塞：请求跑在子线程里
+
+    def _on_chat_thread_done(self):
+        thread = self._chat_thread
+        self._chat_thread = None
+        if thread is not None:
+            try:
+                thread.deleteLater()
+            except Exception:
+                pass
+
+    def _on_ai_reply(self, text):
+        if self._teardown:
+            return
+        if self._history and self._history[-1].get("role") == "user":
+            self._history.append({"role": "assistant", "content": str(text)[:200]})
+            self._history = self._history[-AI_HISTORY_TURNS * 2:]
+        if self.pomo_visible:           # 番茄钟进行中：气泡留给倒计时
+            return
+        self.start_typing(str(text))
+
+    def _on_ai_failed(self, code, detail=""):
+        if self._teardown:
+            return
+        # 失败的这一轮不留在上下文里，免得污染下一轮的上下文
+        if self._history and self._history[-1].get("role") == "user":
+            self._history.pop()
+        if code == "no_key":
+            message = AI_ERROR_NO_KEY
+        else:
+            message = AI_ERROR_LINE
+        self._chat_last_error = (code, detail)
+        self._show_bubble(message, *self._bubble_target(), persistent=False)
+
+    # ---------- 打字机（QTimer 驱动，一个一个字地长出来） ----------
+    def start_typing(self, text):
+        self._cancel_typing()
+        self._type_full = str(text or "")
+        self._type_pos = 0
+        if not self._type_full:
+            return
+        self.show_persistent_bubble("")
+        self.type_job.start(max(1, int(self.ai_typing_ms)))
+
+    def _type_tick(self):
+        if self._teardown:
+            return
+        if self.pomo_visible:          # 番茄钟气泡归倒计时，打字机让位
+            self._cancel_typing()
+            return
+        if self._type_pos >= len(self._type_full):
+            self.type_job.stop()
+            if not self.pomo_visible:
+                # 回复打完后同样按 15 秒空闲规则收起气泡
+                self.hide_bubble_job.start(AI_CHAT_IDLE_MS)
+            return
+        self._type_pos += 1
+        self.update_bubble_in_place(self._type_full[:self._type_pos],
+                                    *self._bubble_target())
+        self.type_job.start(max(1, int(self.ai_typing_ms)))
+
+    def _cancel_typing(self):
+        try:
+            self.type_job.stop()
+        except Exception:
+            pass
+        self._type_full = ""
+        self._type_pos = 0
+
+    def typing_finished(self) -> bool:
+        return bool(self._type_full) and self._type_pos >= len(self._type_full)
+
+    # ============================================================
+    #  ★ 番茄钟状态机（PART D）
+    # ============================================================
+    def start_pomodoro(self):
+        if self.pomodoro is None or self.pomo_state != POMO_IDLE:
+            return
+        self._start_phase(POMO_FOCUS)
+
+    def _start_phase(self, state):
+        """进入 FOCUS / BREAK：立刻开盘，气泡显示新倒计时。"""
+        self._cancel_alarm()
+        self._cancel_typing()          # 气泡归番茄钟，别让打字机抢字
+        self.pomo_state = state
+        self.pomo_visible = True
+        self._pomo_first = True
+        minutes = POMODORO_MINUTES if state == POMO_FOCUS else BREAK_MINUTES
+        self.pomodoro.start(minutes)
+
+    def stop_pomodoro(self):
+        """菜单「停止番茄钟」：停铃、取消定时器、回到 IDLE 并收起气泡。"""
+        self._cancel_alarm()
         if self.pomodoro is not None:
             self.pomodoro.stop()
+        self.pomo_state = POMO_IDLE
+        self.pomo_visible = False
+        self._pomo_first = True
+        self.hide_bubble()
+
+    def _pomodoro_text(self, remaining):
+        if self.pomo_state == POMO_BREAK:
+            return POMO_TEXT_BREAK.format(clock=format_clock(remaining))
+        return POMO_TEXT_FOCUS.format(clock=format_clock(remaining))
+
+    def _on_pomodoro_tick(self, remaining):
+        if not self.pomo_visible:
+            return
+        self._show_pomodoro_bubble(self._pomodoro_text(remaining))
+
+    def _on_pomodoro_finish(self):
+        """倒计时归零 → 进入响铃态（响铃不会自己停）。"""
+        if self.pomo_state == POMO_FOCUS:
+            self._enter_ringing(POMO_FOCUS_RINGING, POMO_TEXT_FOCUS_DONE)
+        elif self.pomo_state == POMO_BREAK:
+            self._enter_ringing(POMO_BREAK_RINGING, POMO_TEXT_BREAK_DONE)
+
+    def _enter_ringing(self, state, text):
+        self.pomo_state = state
+        self.pomo_visible = True
+        self._cancel_typing()          # 响铃提示优先于打字机
+        self.sound.play("chime")
+        self._pomo_first = True
+        self._show_pomodoro_bubble(text)
+        self.alarm_job.start(ALARM_REPEAT_MS)      # 反复响，直到被点击/菜单停止
+
+    def _alarm_tick(self):
+        if self.pomo_state not in POMO_RINGING_STATES:
+            return
+        self.sound.play("chime")
+        self.alarm_job.start(ALARM_REPEAT_MS)
+
+    def dismiss_alarm(self):
+        """左键点击响铃中的角色：停铃 + 立刻开始下一阶段。"""
+        if self.pomo_state == POMO_FOCUS_RINGING:
+            self._start_phase(POMO_BREAK)
+        elif self.pomo_state == POMO_BREAK_RINGING:
+            self._start_phase(POMO_FOCUS)
+
+    def _cancel_alarm(self):
+        if self.alarm_job is not None:
+            self.alarm_job.stop()
+        self.sound.stop()
+
+    def _show_pomodoro_bubble(self, text):
+        """番茄钟气泡：常驻显示（点它也不会改文字）。"""
+        self.show_persistent_bubble(text)
+
+    def _reposition_pomodoro(self):
+        """角色被拖动时，让番茄钟气泡重新贴回头顶。"""
+        if not self.pomo_visible or not self.bubble.isVisible():
+            return
+        if self.pomo_state == POMO_FOCUS_RINGING:
+            text = POMO_TEXT_FOCUS_DONE
+        elif self.pomo_state == POMO_BREAK_RINGING:
+            text = POMO_TEXT_BREAK_DONE
+        elif self.pomodoro is not None and self.pomodoro.running:
+            text = self._pomodoro_text(self.pomodoro.remaining)
+        else:
+            text = POMO_TEXT_FOCUS_DONE
+        self.update_bubble_in_place(text, *self._bubble_target())
+
+    # ============================================================
+    #  右键菜单
+    # ============================================================
+    def _menu_style(self) -> str:
+        p = self.palette
+        return f"""
+        QMenu {{
+            background-color: {p['surface']};
+            border: 1px solid {p['border']};
+            border-radius: {MENU_RADIUS}px;
+            padding: {MENU_PAD_Y}px 6px;
+            color: {p['text']};
+        }}
+        QMenu::item {{
+            background: transparent;
+            color: {p['text']};
+            padding: 7px 22px 7px 14px;
+            border-radius: 8px;
+            min-width: {MENU_MIN_W}px;
+        }}
+        QMenu::item:selected {{
+            background-color: {p['field']};
+            color: {p['accent']};
+        }}
+        QMenu::item:disabled {{
+            color: {p['muted']};
+            background: transparent;
+        }}
+        QMenu::separator {{
+            height: 1px;
+            background: {p['border']};
+            margin: 5px 10px;
+        }}
+        QMenu::right-arrow {{
+            width: 10px;
+            height: 10px;
+        }}
+        """
+
+    def _make_menu(self, owner: QMenu = None) -> QMenu:
+        """每次弹出都重新构建，勾选态 / 可用态一定是最新的。"""
+        menu = QMenu(owner)
+        menu.setWindowFlags(
+            Qt.WindowType.Popup
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        menu.setStyleSheet(self._menu_style())
+        menu.setFont(QFont(BUBBLE_TEXT_FAMILY, MENU_FONT_SIZE))
+        return menu
+
+    @staticmethod
+    def _add_item(menu: QMenu, label, command=None, checked=False, enabled=True):
+        act = menu.addAction(("✓ " if checked else "") + label)
+        act.setCheckable(False)
+        act.setEnabled(enabled and command is not None)
+        if command is not None and enabled:
+            act.triggered.connect(lambda *_: command())
+        return act
+
+    def _pomodoro_menu_label(self) -> str:
+        if self.pomo_state == POMO_FOCUS:
+            return f"专注中 {format_clock(self.pomodoro.remaining)}"
+        if self.pomo_state == POMO_BREAK:
+            return f"休息中 {format_clock(self.pomodoro.remaining)}"
+        if self.pomo_state == POMO_FOCUS_RINGING:
+            return "🍅 时间到（点我一下）"
+        if self.pomo_state == POMO_BREAK_RINGING:
+            return "🍅 休息结束（点我一下）"
+        return "番茄钟未启动"
+
+    def _menu_items(self) -> dict:
+        """保留的兼容入口：返回当前状态快照，方便测试/外部查询。"""
+        return {
+            "paused": self.paused,
+            "pomo_state": self.pomo_state,
+            "pomo_visible": self.pomo_visible,
+            "pomodoro_running": bool(self.pomodoro and self.pomodoro.running),
+            "scale": self.scale,
+            "opacity": self.opacity,
+            "volume": self.sound.volume,
+            "topmost": self.topmost,
+            "affection": self.affection,
+            "clicked_today": self.clicked_today,
+            "chatted_today": self.chatted_today,
+            "chat_open": self.chat_open,
+        }
+
+    def show_menu(self, global_pos: QPoint):
+        root = self._make_menu()
+
+        # 0. 亲密值信息行（两行，都是禁用态，纯展示）
+        self._add_item(root, self.affection_info(), None, enabled=False)
+        self._add_item(root, self.today_status_info(), None, enabled=False)
+        root.addSeparator()
+
+        # 1. 番茄钟 ▸（两阶段循环）
+        tomato = self._make_menu(root)
+        if self.pomodoro is None:
+            self._add_item(tomato, "番茄钟不可用", None, enabled=False)
+        elif self.pomo_state == POMO_IDLE:
+            self._add_item(tomato, f"开始专注 {POMODORO_MINUTES} 分钟", self.start_pomodoro)
+            self._add_item(tomato, "停止番茄钟", None, enabled=False)
+        else:
+            self._add_item(tomato, self._pomodoro_menu_label(), None,
+                           checked=True, enabled=False)
+            self._add_item(tomato, "停止番茄钟", self.stop_pomodoro)
+        tomato.addSeparator()
+        self._add_item(tomato, f"专注 {POMODORO_MINUTES} 分 / 休息 {BREAK_MINUTES} 分",
+                       None, enabled=False)
+        root.addMenu(tomato).setText("番茄钟")
+
+        # 2. 窗口大小 ▸
+        sizes = self._make_menu(root)
+        cur_pct = int(round(self.scale * 100))
+        self._add_item(sizes, "放大　(+)", lambda: self.set_scale(self.scale * 1.12))
+        self._add_item(sizes, "缩小　(-)", lambda: self.set_scale(self.scale / 1.12))
+        sizes.addSeparator()
+        for name, value in SCALE_PRESETS:
+            pct = int(round(value * 100))
+            self._add_item(sizes, f"{name}　{pct}%",
+                           (lambda v=value: self.set_scale(v)),
+                           checked=abs(cur_pct - pct) < 5)
+        sizes.addSeparator()
+        self._add_item(sizes, "恢复默认大小", lambda: self.set_scale(self._default_scale()))
+        self._add_item(sizes, "滚轮也可以调整大小", None, enabled=False)
+        root.addMenu(sizes).setText("窗口大小")
+
+        # 3. 不透明度 ▸
+        opacity = self._make_menu(root)
+        cur_op = int(round(self.opacity * 100))
+        for pct in OPACITY_PRESETS:
+            self._add_item(opacity, f"{pct}%",
+                           (lambda v=pct: self.set_opacity(v / 100.0)),
+                           checked=abs(cur_op - pct) < 5)
+        opacity.addSeparator()
+        self._add_item(opacity, "Ctrl + 滚轮 也可以调整", None, enabled=False)
+        root.addMenu(opacity).setText("不透明度")
+
+        # 4. 音效音量 ▸
+        volume = self._make_menu(root)
+        for pct in VOLUME_PRESETS:
+            self._add_item(volume, f"{pct}%",
+                           (lambda v=pct: self.set_volume(v)),
+                           checked=self.sound.volume == pct)
+        volume.addSeparator()
+        self._add_item(volume, "点击角色和气泡都会响", None, enabled=False)
+        root.addMenu(volume).setText("音效音量")
+
+        # 5. 窗口置顶
+        self._add_item(root, "窗口置顶", self.toggle_topmost, checked=self.topmost)
+        root.addSeparator()
+        # 6. 退出
+        self._add_item(root, "退出", self.quit)
+
+        # 圆角菜单必须自己画背景，否则四角会露出方形底色
+        root.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        root.popup(global_pos)
+        self.menu = root          # 保存引用，避免被 GC 立刻回收
+
+    # ---------- 音量 ----------
+    def set_volume(self, volume):
+        self.sound.set_volume(volume)
+        self.volume = self.sound.volume
+        self.sound.play("release")       # 立即试听
+
+    # ---------- 退出 ----------
+    def quit(self):
+        if self._teardown:
+            return
+        self._teardown = True
+        self._cancel_typing()
+        self._cancel_alarm()
+        for timer in (self.anim_job, self.hide_bubble_job, self.alarm_job,
+                      self.type_job, self.chat_idle_job,
+                      getattr(self.pomodoro, "timer", None)):
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+        for anim in (self.jump_anim, self.bubble_fade):
+            try:
+                anim.stop()
+            except Exception:
+                pass
+        if self.pomodoro is not None:
+            self.pomodoro.stop()
+        thread = self._chat_thread
+        if thread is not None and thread.isRunning():
+            try:
+                thread.wait(1500)
+            except Exception:
+                pass
         self.sound.stop()
         self._save_config()
-        try:
-            self.menu.close()
-        except Exception:
-            pass
-        self.bubble.destroy()
-        try:
-            self.root.quit()
-        except Exception:
-            pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-        os._exit(0)
+        for extra in (getattr(self, "chat_input", None), getattr(self, "bubble", None)):
+            if extra is not None:
+                try:
+                    extra.hide()
+                    extra.close()
+                except Exception:
+                    pass
+        menu = getattr(self, "menu", None)
+        if menu is not None:
+            try:
+                menu.close()
+            except Exception:
+                pass
+        self.hide()
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
 
-def pick_image_path():
-    """按优先级挑角色图：环境变量 > pet_config.json 的 image > 顶部 IMAGE_PATH。"""
-    candidates = [os.environ.get("DESKTOP_PET_IMAGE")]
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            candidates.append(json.load(f).get("image"))
-    except Exception:
-        pass
-    candidates.append(IMAGE_PATH)
-    for path in candidates:
-        if path and os.path.exists(path):
-            return path
-    return candidates[-1]
-
-
+# ---------------- 入口 ----------------
 def main():
-    enable_dpi_awareness()
+    enable_dpi_awareness()          # 必须在 QApplication 之前（Win32）
+    apply_high_dpi_policy()         # 再设 Qt 的 PassThrough，最后才建 QApplication
 
-    image_path = pick_image_path()
-    if not os.path.exists(image_path):
-        r = tk.Tk()
-        r.withdraw()
-        from tkinter import messagebox
-        messagebox.showerror(
-            "桌面宠物 / Desktop Pet",
-            f"找不到角色图片：\n{image_path}\n\n"
-            "请把你的 GIF/PNG 放到 assets/pet.gif，\n"
-            "或修改 desktop_pet.py 顶部的 IMAGE_PATH。",
-        )
-        r.destroy()
-        return
+    app = QApplication(sys.argv)
+    app.setApplicationName("DesktopPet")
+    app.setQuitOnLastWindowClosed(False)
 
-    frames, durations = load_frames(image_path)
-    box = content_box(frames)
+    if not os.path.exists(IMAGE_PATH):
+        QMessageBox.critical(None, "桌面宠物", f"找不到角色图片：\n{IMAGE_PATH}")
+        return 1
+    if not os.path.exists(BUBBLE_PATH):
+        QMessageBox.critical(None, "桌面宠物", f"找不到气泡图片：\n{BUBBLE_PATH}")
+        return 1
 
-    root = tk.Tk()
-    DesktopPet(root, frames, durations, box)
-    root.mainloop()
+    ensure_ai_config(CONFIG_PATH)   # 没有 config.json 就生成一份空 Key 的
+    pet = DesktopPet(IMAGE_PATH)
+    pet.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

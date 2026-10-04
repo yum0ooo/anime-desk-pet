@@ -1,6 +1,5 @@
-# 核心依赖：图像解码 / 缩放 / 渲染
+# 图像处理：角色图缩放（LANCZOS）+ 气泡底图合成
 Pillow>=9.0
 
-# 番茄钟的倒计时使用 PySide6 的 QTimer。
-# 不装也能跑，只是右键菜单里的「番茄钟」会变成灰色不可用。
+# GUI 框架本身 + QPropertyAnimation 弹跳动画 + QThread 异步网络请求
 PySide6>=6.5
